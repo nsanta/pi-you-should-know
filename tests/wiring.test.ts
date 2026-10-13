@@ -180,9 +180,9 @@ describe("you-should-know wiring", () => {
     await flush();
     expect(registry.calls()).toHaveLength(1);
     expect(lastWidgetArg(ui)).toEqual([
-      "<warning>[warning] Silent assumption",
-      "<error>[critical] Hidden decision",
-      "<accent>Actions: /ysk learn · known · chat · dismiss",
+      "<error>✦ Heads up · Hidden decision",
+      "<muted>+1 more · /ysk",
+      "<accent>1: Learn more  2: Knew this already  0: Dismiss",
     ]);
 
     // Counter reset: two more steps trigger exactly one more review.
