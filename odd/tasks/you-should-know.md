@@ -1,7 +1,7 @@
 # Feature: you-should-know (pi extension)
 
-Status: in_progress
-Branch: feature/you-should-know (after bootstrap commit)
+Status: completed
+Branch: feature/you-should-know (5 commits, 2487093..c6e125b)
 Created: 2026-02-14
 Engram mirror: DEFERRED — engram rejects unknown project `pi-you-should-know`;
 retry after the project is registered (first commit).
@@ -98,3 +98,10 @@ verification (gentle-ai-verify) and close.
 | T2+T3 core | 8872c8a | 55 vitest tests green; tsc --noEmit clean; worker noted streamSimple adapter integration check deferred to T5 |
 | T4 widget+actions | 788b868 | 36 focused tests green; pi-tui width utils deferred (undeclared transitive dep) — conservative truncation documented |
 | T5 tool+wiring+README | 0b23d94 | 82 new tests, suite 118 green; typecheck clean; streamSimple adapter verified against installed types |
+| T6 verify+close | c6e125b | Independent verify PASS (118/118, tsc clean, lifecycle/adapter/widget/parser checked vs installed types; headless/RPC safe). Minor notes: orphaned in-flight call on session replacement (wasted call, gen-guarded); char-count truncation vs wide glyphs (accepted, documented). Engram mirror still deferred (project unknown to engram). |
+| Native review | lineage review-dc2c8810f174ede6, target sha256:4eb3011e… | APPROVED (reliability lens); authority burned, burn evidence gentle-ai.review-acknowledged/v1. 4 advisory SUGGESTIONS (non-blocking, follow-ups): digest includes custom_message entries (reviewer.ts:197), negative /ysk index parsing (actions.ts:44), saveDismissed non-atomic write (config.ts:67), /ysk status omits session dismissals (index.ts:292). |
+
+## Residual (post-close, by decision)
+- Advisory review suggestions above = future hardening work.
+- No real-TUI manual smoke test yet (all tests are fake-pi): try `pi --extension /home/nicolas/projects/pi-you-should-know`.
+- Push / PR / merge to main = user decision; branch left local.
