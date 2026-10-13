@@ -24,11 +24,11 @@ import type {
 import { matchesKey } from "@earendil-works/pi-tui";
 import { DEFAULT_REVIEW_EVERY, loadConfig, saveDismissed, type YskConfig } from "./config.ts";
 import { wireActions } from "./actions.ts";
-import { NoteStore, type Note } from "./notes.ts";
+import { formatNotesForChat, NoteStore, type Note } from "./notes.ts";
 import { buildDigest, runReviewer, type ReviewerRequest } from "./reviewer.ts";
 import { StepCounter } from "./steps.ts";
 import { registerHeadsUpTool } from "./tool.ts";
-import { severityColorToken, severityLabel, truncateLine, widgetLines } from "./widget.ts";
+import { KEY_ACTIONS, severityColorToken, severityLabel, truncateLine, widgetLines } from "./widget.ts";
 
 const WIDGET_ID = "ysk";
 const USER_CONFIG_PATH = "~/.pi/agent/you-should-know.json";
@@ -57,6 +57,10 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   let generation = 0;
   let inFlight = false;
   let currentController: AbortController | null = null;
+  // Key-layer state: which pending note is expanded (its topic), plus the
+  // terminal-input unsubscribe handle for the current session.
+  let expandedTopic: string | null = null;
+  let unsubscribeInput: (() => void) | null = null;
 
   // Persistence of permanent dismissals flows through the /ysk ActionDeps
   // (`persist` below), the single write path; no store-level callback.
@@ -69,10 +73,16 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     try {
       if (!ctx.hasUI) return;
       const pending = store.pending;
+      const newest = pending.length > 0 ? pending[pending.length - 1] : undefined;
+      // Expansion is only valid while the newest pending note is still the
+      // expanded one: a newer note arriving or the target disappearing
+      // silently resets to the collapsed band.
+      if (expandedTopic !== null && newest?.topic !== expandedTopic) expandedTopic = null;
+      const expanded = newest !== undefined && newest.topic === expandedTopic;
       const lines =
-        pending.length === 0
+        newest === undefined
           ? undefined
-          : widgetLines(pending, { width: DEFAULT_WIDGET_WIDTH }).map((row) =>
+          : widgetLines(pending, { width: DEFAULT_WIDGET_WIDTH, expanded }).map((row) =>
               ctx.ui.theme.fg(severityColorToken(row.severity), row.text),
             );
       ctx.ui.setWidget(WIDGET_ID, lines, { placement: "aboveEditor" });
@@ -106,6 +116,8 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     for (const topic of sessionConfig.dismissedTopics) {
       if (!store.isDismissed(topic)) store.dismissPermanently(topic);
     }
+    expandedTopic = null; // a fresh session starts with the collapsed band
+    subscribeTerminalInput(ctx);
     renderWidget(ctx);
   }
 
@@ -118,8 +130,93 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     }
     currentController = null;
     inFlight = false;
+    unsubscribeTerminalInput();
     ctxRef = null;
   });
+
+  // --- terminal-input key layer (TUI-only) ----------------------------------
+
+  /** Detach the current session's terminal-input handler, if any. */
+  function unsubscribeTerminalInput(): void {
+    const unsubscribe = unsubscribeInput;
+    unsubscribeInput = null;
+    if (!unsubscribe) return;
+    try {
+      unsubscribe();
+    } catch {
+      // quiet: a stale unsubscribe must never crash the session
+    }
+  }
+
+  /**
+   * Subscribe the number-key handler for one session. TUI-only: headless and
+   * RPC contexts never subscribe, so the keys stay untouched. Called on every
+   * session_start after the previous session's handler was detached.
+   */
+  function subscribeTerminalInput(ctx: ExtensionContext): void {
+    unsubscribeTerminalInput();
+    if (!ctx.hasUI || ctx.mode !== "tui") return;
+    try {
+      unsubscribeInput = ctx.ui.onTerminalInput(handleTerminalInput) ?? null;
+    } catch {
+      unsubscribeInput = null; // quiet: input interception is best-effort
+    }
+  }
+
+  /**
+   * Number-key actions on the NEWEST pending note while the band is shown.
+   * Collapsed: 1 expands, 2 dismisses permanently, 0 dismisses for the
+   * session. Expanded: 1 acknowledges (collapse, note stays pending), 2
+   * fills the editor with the composed explanation, 0 dismisses + collapses.
+   * Everything else — multi-character chunks, pastes, unknown keys, no
+   * pending notes, non-TUI contexts — returns undefined so the key reaches
+   * the editor untouched. Key labels come from KEY_ACTIONS, never literals.
+   */
+  function handleTerminalInput(data: string): { consume: boolean } | undefined {
+    const ctx = ctxRef;
+    if (!ctx || !ctx.hasUI || ctx.mode !== "tui") return undefined;
+    if (typeof data !== "string" || data.length !== 1) return undefined; // paste/multi-byte chunk
+    const pending = store.pending;
+    const newest = pending.length > 0 ? pending[pending.length - 1] : undefined;
+    if (!newest) return undefined; // nothing shown: keys are the editor's
+    const expanded = expandedTopic !== null && newest.topic === expandedTopic;
+
+    if (data === (expanded ? KEY_ACTIONS.expanded.dismiss : KEY_ACTIONS.collapsed.dismiss)) {
+      expandedTopic = null;
+      store.dismissSession(newest.topic);
+      renderWidget(ctx);
+      return { consume: true };
+    }
+    if (data === (expanded ? KEY_ACTIONS.expanded.understood : KEY_ACTIONS.collapsed.learn)) {
+      // Expand acts on the newest note; "understood" collapses without
+      // dismissing (non-destructive acknowledgment).
+      expandedTopic = expanded ? null : newest.topic;
+      renderWidget(ctx);
+      return { consume: true };
+    }
+    if (data === (expanded ? KEY_ACTIONS.expanded.chat : KEY_ACTIONS.collapsed.known)) {
+      if (expanded) {
+        fillEditor(newest); // prompt fill only: never sends, never dismisses
+      } else {
+        store.dismissPermanently(newest.topic);
+        void persistDismissed(store.dismissedTopics);
+        renderWidget(ctx);
+      }
+      return { consume: true };
+    }
+    return undefined;
+  }
+
+  /** Fill the prompt editor with the chat-composed explanation (TUI-only). */
+  function fillEditor(note: Note): void {
+    const ctx = ctxRef;
+    if (!ctx || !ctx.hasUI) return;
+    try {
+      ctx.ui.setEditorText(`Re: heads-up — please address\n\n${formatNotesForChat([note])}`);
+    } catch {
+      // editor fill is best-effort and must never crash the session
+    }
+  }
 
   // --- review cadence ------------------------------------------------------
 

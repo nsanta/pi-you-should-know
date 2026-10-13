@@ -75,10 +75,18 @@ function fakeModelRegistry(outcome: StreamOutcome = {}) {
 }
 
 function mockCtx(registry: ReturnType<typeof fakeModelRegistry>, overrides: Record<string, unknown> = {}) {
+  /** One unique unsubscribe spy per onTerminalInput subscription. */
+  const unsubscribers: Array<ReturnType<typeof vi.fn>> = [];
   const ui = {
     notify: vi.fn(),
     setWidget: vi.fn(),
+    setEditorText: vi.fn(),
     custom: vi.fn(async (..._args: unknown[]) => undefined),
+    onTerminalInput: vi.fn((_handler: unknown) => {
+      const unsubscribe = vi.fn();
+      unsubscribers.push(unsubscribe);
+      return unsubscribe;
+    }),
     theme: { fg: vi.fn((token: string, text: string) => `<${token}>${text}`) },
   };
   const ctx: any = {
@@ -93,7 +101,7 @@ function mockCtx(registry: ReturnType<typeof fakeModelRegistry>, overrides: Reco
     model: { provider: "sess", id: "session-model" },
     ...overrides,
   };
-  return { ctx, ui };
+  return { ctx, ui, unsubscribers };
 }
 
 async function setup(
@@ -122,10 +130,10 @@ async function setup(
     },
   };
   const registry = fakeModelRegistry(options.outcome);
-  const { ctx, ui } = mockCtx(registry, { hasUI: options.hasUI ?? true, ...options.ctxOverrides });
+  const { ctx, ui, unsubscribers } = mockCtx(registry, { hasUI: options.hasUI ?? true, ...options.ctxOverrides });
   youShouldKnowExtension(pi as never);
   await handlers.get("session_start")![0]({ type: "session_start", reason: "startup" }, ctx);
-  return { registry, ctx, ui, sent, tools, commands, handlers };
+  return { registry, ctx, ui, unsubscribers, sent, tools, commands, handlers };
 }
 
 const flush = async (): Promise<void> => {
@@ -142,6 +150,22 @@ const widgetText = (ui: { setWidget: any }): string =>
 
 async function addNoteViaTool(tools: Map<string, any>, note: string, severity?: string): Promise<any> {
   return tools.get("heads_up").execute("id", severity ? { note, severity } : { note });
+}
+
+/** The terminal-input handler registered by the most recent session. */
+const inputHandler = (ui: { onTerminalInput: any }): ((data: string) => { consume?: boolean } | undefined) =>
+  ui.onTerminalInput.mock.calls.at(-1)![0];
+
+/** Register a pending note and let the runtime render it, then return the key handler. */
+async function setupWithPendingNote(
+  options: Parameters<typeof setup>[0] = {},
+  note = "Deployment gate is manual",
+  severity?: string,
+) {
+  const session = await setup(options);
+  await addNoteViaTool(session.tools, note, severity);
+  session.handlers.get("tool_execution_end")![0](toolEndEvent("ysk-keys"), session.ctx);
+  return { ...session, handler: inputHandler(session.ui) };
 }
 
 // --- tests -------------------------------------------------------------------
@@ -365,5 +389,120 @@ describe("you-should-know wiring", () => {
     registry.release({ stopReason: "stop", content: [{ type: "text", text: REVIEW_JSON }] });
     await flush();
     expect(lastWidgetArg(ui)).toBeUndefined();
+  });
+
+  // --- terminal-input key layer (T2) -----------------------------------------
+
+  it("subscribes one terminal-input handler per TUI session, unsubscribes on shutdown, re-subscribes on session_start", async () => {
+    const { ui, unsubscribers, handlers, ctx } = await setup();
+    expect(ui.onTerminalInput).toHaveBeenCalledOnce();
+    expect(ui.onTerminalInput.mock.calls[0]![0]).toBeTypeOf("function");
+
+    handlers.get("session_shutdown")![0]({ type: "session_shutdown", reason: "quit" }, ctx);
+    expect(unsubscribers[0]).toHaveBeenCalledOnce();
+
+    // Session replacement: the stale handler is detached before the new one subscribes.
+    await handlers.get("session_start")![0]({ type: "session_start", reason: "resume" }, ctx);
+    expect(ui.onTerminalInput).toHaveBeenCalledTimes(2);
+    expect(unsubscribers[0]).toHaveBeenCalledOnce();
+    expect(unsubscribers[0]!.mock.invocationCallOrder[0]).toBeLessThan(ui.onTerminalInput.mock.invocationCallOrder[1]!);
+  });
+
+  it("never subscribes terminal input outside TUI contexts", async () => {
+    const headless = await setup({ hasUI: false });
+    expect(headless.ui.onTerminalInput).not.toHaveBeenCalled();
+
+    const rpc = await setup({ ctxOverrides: { mode: "rpc" } });
+    expect(rpc.ui.onTerminalInput).not.toHaveBeenCalled();
+  });
+
+  it("collapsed '1' expands the newest note in place and consumes the key", async () => {
+    const { ui, handler } = await setupWithPendingNote();
+    expect(String(lastWidgetArg(ui))).toContain("Learn more");
+
+    expect(handler("1")).toEqual({ consume: true });
+    const expanded = String(lastWidgetArg(ui));
+    expect(expanded).toContain("Understood");
+    expect(expanded).toContain("Deployment gate is manual");
+  });
+
+  it("expanded '2' fills the editor with the composed explanation instead of sending", async () => {
+    const { ui, handler, sent } = await setupWithPendingNote({}, "Deployment gate is manual\ndetail body", "warning");
+    handler("1"); // expand
+
+    expect(handler("2")).toEqual({ consume: true });
+    expect(ui.setEditorText).toHaveBeenCalledOnce();
+    const text = ui.setEditorText.mock.calls[0]![0] as string;
+    expect(text).toContain("Re: heads-up — please address");
+    expect(text).toContain("Deployment gate is manual");
+    expect(text).toContain("detail body");
+    expect(sent).toHaveLength(0); // never auto-sends
+    expect(String(lastWidgetArg(ui))).toContain("Deployment gate is manual"); // note stays pending
+  });
+
+  it("expanded '1' acknowledges non-destructively and collapses back", async () => {
+    const { ui, handler } = await setupWithPendingNote();
+    handler("1"); // expand
+
+    expect(handler("1")).toEqual({ consume: true });
+    const collapsed = String(lastWidgetArg(ui));
+    expect(collapsed).toContain("Learn more");
+    expect(collapsed).not.toContain("Understood");
+    expect(collapsed).toContain("Deployment gate is manual"); // note still pending
+    expect(ui.setEditorText).not.toHaveBeenCalled();
+  });
+
+  it("collapsed '2' dismisses permanently and persists through the config path", async () => {
+    const { ui, handler } = await setupWithPendingNote();
+
+    expect(handler("2")).toEqual({ consume: true });
+    await flush();
+    expect(readProjectConfig().dismissedTopics).toContain("deployment gate is manual");
+    expect(lastWidgetArg(ui)).toBeUndefined(); // widget cleared
+  });
+
+  it("collapsed '0' dismisses for the session without persisting", async () => {
+    const { ui, handler } = await setupWithPendingNote();
+
+    expect(handler("0")).toEqual({ consume: true });
+    expect(lastWidgetArg(ui)).toBeUndefined();
+    expect(readProjectConfig().dismissedTopics ?? []).toHaveLength(0);
+  });
+
+  it("expanded '0' dismisses for the session and collapses", async () => {
+    const { ui, handler } = await setupWithPendingNote();
+    handler("1"); // expand
+
+    expect(handler("0")).toEqual({ consume: true });
+    expect(lastWidgetArg(ui)).toBeUndefined();
+    expect(readProjectConfig().dismissedTopics ?? []).toHaveLength(0);
+  });
+
+  it("passes keys through untouched when no note is pending", async () => {
+    const { ui } = await setup();
+    const handler = inputHandler(ui);
+    expect(handler("1")).toBeUndefined();
+    expect(handler("2")).toBeUndefined();
+    expect(handler("0")).toBeUndefined();
+  });
+
+  it("never consumes multi-character input (paste chunks), even with a pending note", async () => {
+    const { ui, handler } = await setupWithPendingNote();
+
+    expect(handler("12")).toBeUndefined();
+    expect(handler("1abc")).toBeUndefined();
+    expect(String(lastWidgetArg(ui))).toContain("Learn more"); // state untouched
+  });
+
+  it("expansion silently resets to collapsed when a newer note arrives", async () => {
+    const { ui, tools, handlers, ctx, handler } = await setupWithPendingNote({}, "First note topic", "info");
+    handler("1"); // expand the newest (first) note
+    expect(String(lastWidgetArg(ui))).toContain("Understood");
+
+    await addNoteViaTool(tools, "Second note topic");
+    handlers.get("tool_execution_end")![0](toolEndEvent("ysk-newer"), ctx);
+    const rendered = String(lastWidgetArg(ui));
+    expect(rendered).toContain("Learn more");
+    expect(rendered).not.toContain("Understood");
   });
 });
