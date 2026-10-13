@@ -94,4 +94,7 @@ verification (gentle-ai-verify) and close.
 
 | Task | Commit | Result |
 | ---- | ------ | ------ |
-| (pending) | | |
+| T1 scaffold | 2487093 (main, bootstrap; branch feature/you-should-know created) | typecheck + vitest green on skeleton |
+| T2+T3 core | 8872c8a | 55 vitest tests green; tsc --noEmit clean; worker noted streamSimple adapter integration check deferred to T5 |
+| T4 widget+actions | 788b868 | 36 focused tests green; pi-tui width utils deferred (undeclared transitive dep) — conservative truncation documented |
+| T5 tool+wiring+README | 0b23d94 | 82 new tests, suite 118 green; typecheck clean; streamSimple adapter verified against installed types |
