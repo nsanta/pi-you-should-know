@@ -1,0 +1,22 @@
+{
+  "name": "pi-you-should-know",
+  "version": "0.1.0",
+  "description": "Pi extension: quiet background reviewer that surfaces hidden decisions and silent assumptions as non-blocking 'You should know' notes above the prompt.",
+  "type": "module",
+  "license": "MIT",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "typebox": "^1.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
