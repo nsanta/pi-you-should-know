@@ -21,8 +21,10 @@ prompt-fill for handing the note to the main session.
   auto-send.
 - Key 1 expands the note IN PLACE inside the widget band; the `ctx.ui.custom` modal
   overlay is removed; `/ysk learn` opens the same expanded state.
-- Presentation timing: a pending note becomes visible on `turn_end` (when the chat answer
-  completes), not mid-turn; the agent loop stays uninterrupted.
+- Presentation timing: a pending note becomes visible when the chat answer completes —
+  implemented on pi's `agent_end` / `agent_settled` loop boundary (user-approved "on turn
+  end" intent = answer completion; pi's literal `turn_end` fires between tool rounds
+  mid-task, which would leak notes mid-task). The agent loop stays uninterrupted.
 - Key maps (from screenshots):
   - collapsed: `1: Learn more  2: Knew this already  0: Dismiss`
   - expanded:  `1: Understood  2: Chat in main session  0: Dismiss`
@@ -72,11 +74,11 @@ fills editor; ActionDeps updated (showOverlay replaced by expandNote, sendChat -
 fillEditor); widget.ts/actions docs updated. Tests updated.
 Acceptance: no `ctx.ui.custom` references remain; all actions covered; green.
 
-### T4. Turn-end presentation
-`src/index.ts`: queue widget updates during an active turn; render on `turn_end`;
-`tool_execution_end` still drives review. Wiring test: note created mid-turn renders only
-after turn_end event.
-Acceptance: mid-turn setWidget calls asserted absent; turn_end renders; green.
+### T4. Answer-completion presentation
+`src/index.ts`: queue widget updates while the agent loop is active (`agent_start`);
+render on `agent_end` and `agent_settled` (idempotent, dirty-flag); `tool_execution_end`
+still drives review. Wiring test: note created mid-loop renders only after agent_end.
+Acceptance: mid-loop setWidget calls asserted absent; completion renders; green.
 
 ### T5. README + verification + review
 README interaction section (keys, /ysk parity, timing); full suite + typecheck;
@@ -87,3 +89,8 @@ Acceptance: verify PASS or documented follow-ups; review approved or correction 
 
 | Task | Commit | Result |
 | ---- | ------ | ------ |
+| T1 widget two-state | 4ea8c72 | 125/125 vitest green, tsc clean; KEY_ACTIONS exported; collapsed/expanded layouts per screenshots; wiring assertions updated minimally |
+| T2 key interception | f55563e | 136/136 green, tsc clean; 1/2/0 consumed only while a note is shown; editor fill on 2; expansion topic tracking; subscribe/unsubscribe lifecycle covered |
+| T3 overlay removal + remap | 903ff89 | 137/137 green, tsc clean; no ui.custom/matchesKey/pi-tui refs in src; /ysk learn expands in place, /ysk chat fills editor; unused pi-tui dep removed |
+| T4 answer-completion gating | 6044e26 | 141/141 green, tsc clean; mid-loop renders deferred (dirty flag), agent_end/agent_settled flush; boundary decision corrected from literal turn_end to agent_end (turn_end fires mid-task) |
+| T5 docs + verify | 143d8d3 | README keys/timing/parity documented; gentle-ai-verify PASS at 143d8d3: 141/141, tsc clean, installed-API cross-check clean, no wedge/double-render/leak; 2 non-blocking notes (mid-loop key capture on deferred band; fixed width 100) |
