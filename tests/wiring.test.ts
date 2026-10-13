@@ -175,7 +175,14 @@ describe("you-should-know wiring", () => {
     const { tools, commands, handlers } = await setup();
     expect(tools.get("heads_up")?.parameters).toBeDefined();
     expect(commands.get("ysk")?.handler).toBeTypeOf("function");
-    for (const event of ["session_start", "session_shutdown", "tool_execution_end"]) {
+    for (const event of [
+      "session_start",
+      "session_shutdown",
+      "tool_execution_end",
+      "agent_start",
+      "agent_end",
+      "agent_settled",
+    ]) {
       expect(handlers.get(event)?.length).toBe(1);
     }
   });
@@ -519,5 +526,60 @@ describe("you-should-know wiring", () => {
     const rendered = String(lastWidgetArg(ui));
     expect(rendered).toContain("Learn more");
     expect(rendered).not.toContain("Understood");
+  });
+});
+
+// --- answer-completion presentation (T4) --------------------------------------
+
+describe("you-should-know answer-completion presentation", () => {
+  it("defers widget writes while the agent loop runs and flushes notes at agent_end", async () => {
+    const { ui, registry, handlers, ctx } = await setup({ config: { reviewEvery: 1 } });
+    handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
+    const callsWhenLoopStarted = widgetCalls(ui).length;
+
+    handlers.get("tool_execution_end")![0](toolEndEvent("a"), ctx);
+    await flush();
+    expect(registry.calls()).toHaveLength(1); // reviewer still runs mid-loop
+    expect(widgetCalls(ui).length).toBe(callsWhenLoopStarted); // no widget write while active
+    expect(widgetText(ui)).not.toContain("Hidden decision");
+
+    handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
+    expect(widgetText(ui)).toContain("Hidden decision"); // presented at completion
+  });
+
+  it("renders immediately when the agent loop is idle", async () => {
+    const { ui, tools, handlers, ctx } = await setup();
+    await addNoteViaTool(tools, "Idle note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("ysk-idle"), ctx);
+    expect(widgetText(ui)).toContain("Idle note");
+  });
+
+  it("agent_settled is the safety net: flushes pending renders without a second render at agent_end", async () => {
+    const { ui, tools, handlers, ctx } = await setup();
+    await addNoteViaTool(tools, "Settled note");
+    handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
+    handlers.get("tool_execution_end")![0](toolEndEvent("ysk-settle"), ctx); // deferred: dirty
+    expect(widgetText(ui)).not.toContain("Settled note");
+
+    handlers.get("agent_settled")![0]({ type: "agent_settled", aborted: false }, ctx);
+    expect(widgetText(ui)).toContain("Settled note");
+    const callsAfterSettle = widgetCalls(ui).length;
+
+    handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
+    expect(widgetCalls(ui).length).toBe(callsAfterSettle); // flag cleared: idempotent
+  });
+
+  it("defers dismissals mid-loop and flushes the cleared band at agent_end", async () => {
+    const { ui, handler, handlers, ctx } = await setupWithPendingNote();
+    expect(String(lastWidgetArg(ui))).toContain("Deployment gate is manual");
+    handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
+    const callsBeforeDismiss = widgetCalls(ui).length;
+
+    expect(handler("0")).toEqual({ consume: true }); // session dismissal mid-loop
+    expect(widgetCalls(ui).length).toBe(callsBeforeDismiss); // write deferred
+    expect(widgetText(ui)).toContain("Deployment gate is manual"); // band still up
+
+    handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
+    expect(lastWidgetArg(ui)).toBeUndefined(); // flushed: empty band clears the widget
   });
 });

@@ -4,9 +4,13 @@
  * A quiet background reviewer: every `reviewEvery` completed tool steps it
  * sends a bounded transcript digest to a nested model call
  * (ctx.modelRegistry.streamSimple) and surfaces findings as non-blocking
- * HUD notes above the prompt. Core logic (step counting, reviewing, the
- * note store) runs in every mode; only widget, editor-fill, terminal-input,
- * and notification touches are guarded behind ctx.hasUI / ctx.mode === "tui".
+ * HUD notes above the prompt. Notes become visible only when the chat answer
+ * completes: while the agent loop is active (agent_start..agent_end) every
+ * widget write is deferred behind a dirty flag and flushed on agent_end /
+ * agent_settled, so mid-task tool rounds never leak notes. Core logic (step
+ * counting, reviewing, the note store) runs in every mode; only widget,
+ * editor-fill, terminal-input, and notification touches are guarded behind
+ * ctx.hasUI / ctx.mode === "tui".
  *
  * Failure policy: quiet by design. A broken reviewer, a missing model, or a
  * widget hiccup must never throw into the runtime; /ysk status is the
@@ -15,6 +19,9 @@
 
 import { join } from "node:path";
 import type {
+  AgentEndEvent,
+  AgentSettledEvent,
+  AgentStartEvent,
   ExtensionAPI,
   ExtensionContext,
   SessionStartEvent,
@@ -56,6 +63,12 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   let generation = 0;
   let inFlight = false;
   let currentController: AbortController | null = null;
+  // Answer-completion presentation: while an agent loop is running, widget
+  // writes are deferred (renderDirty) and flushed at the loop boundary, so
+  // notes only surface when the chat answer completes. Session-scoped; reset
+  // on session_start/session_shutdown.
+  let agentActive = false;
+  let renderDirty = false;
   // Key-layer state: which pending note is expanded (its topic), plus the
   // terminal-input unsubscribe handle for the current session.
   let expandedTopic: string | null = null;
@@ -67,7 +80,22 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
 
   // --- widget --------------------------------------------------------------
 
-  function renderWidget(ctx: ExtensionContext | null): void {
+  /**
+   * Dirty-aware render entry point. While the agent loop is active every
+   * render request (reviewer note arrival, heads_up additions, dismissals,
+   * /ysk actions) only marks the widget dirty; the loop-boundary handlers
+   * flush it. When idle, renders behave exactly as before: immediate write.
+   */
+  function requestRender(ctx: ExtensionContext | null): void {
+    if (agentActive) {
+      renderDirty = true;
+      return;
+    }
+    writeWidget(ctx);
+  }
+
+  /** The actual widget writer; safe to call repeatedly (idempotent output). */
+  function writeWidget(ctx: ExtensionContext | null): void {
     if (!ctx) return;
     try {
       if (!ctx.hasUI) return;
@@ -99,6 +127,8 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     ctxRef = ctx;
     inFlight = false;
     currentController = null;
+    agentActive = false;
+    renderDirty = false;
     counter = new StepCounter();
     try {
       const cwd = typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
@@ -117,7 +147,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     }
     expandedTopic = null; // a fresh session starts with the collapsed band
     subscribeTerminalInput(ctx);
-    renderWidget(ctx);
+    requestRender(ctx);
   }
 
   pi.on("session_shutdown", (_event: SessionShutdownEvent, _ctx: ExtensionContext) => {
@@ -129,9 +159,37 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     }
     currentController = null;
     inFlight = false;
+    agentActive = false;
+    renderDirty = false;
     unsubscribeTerminalInput();
     ctxRef = null;
   });
+
+  // --- answer-completion boundary (agent loop gating) -----------------------
+
+  pi.on("agent_start", (_event: AgentStartEvent, _ctx: ExtensionContext) => {
+    agentActive = true;
+  });
+
+  pi.on("agent_end", (_event: AgentEndEvent, ctx: ExtensionContext) => {
+    agentActive = false;
+    flushDirtyRender(ctx);
+  });
+
+  pi.on("agent_settled", (_event: AgentSettledEvent, ctx: ExtensionContext) => {
+    // Safety net: also fires for aborted/errored loops that never reach a
+    // clean agent_end, so the dirty flag can never wedge the widget. The
+    // flag clears before writing, keeping the agent_end pair idempotent.
+    agentActive = false;
+    flushDirtyRender(ctx);
+  });
+
+  /** Flush one deferred widget write: clear the dirty flag first, then write. */
+  function flushDirtyRender(ctx: ExtensionContext): void {
+    if (!renderDirty) return;
+    renderDirty = false;
+    writeWidget(ctx);
+  }
 
   // --- terminal-input key layer (TUI-only) ----------------------------------
 
@@ -183,14 +241,14 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     if (data === (expanded ? KEY_ACTIONS.expanded.dismiss : KEY_ACTIONS.collapsed.dismiss)) {
       expandedTopic = null;
       store.dismissSession(newest.topic);
-      renderWidget(ctx);
+      requestRender(ctx);
       return { consume: true };
     }
     if (data === (expanded ? KEY_ACTIONS.expanded.understood : KEY_ACTIONS.collapsed.learn)) {
       // Expand acts on the newest note; "understood" collapses without
       // dismissing (non-destructive acknowledgment).
       expandedTopic = expanded ? null : newest.topic;
-      renderWidget(ctx);
+      requestRender(ctx);
       return { consume: true };
     }
     if (data === (expanded ? KEY_ACTIONS.expanded.chat : KEY_ACTIONS.collapsed.known)) {
@@ -199,7 +257,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       } else {
         store.dismissPermanently(newest.topic);
         void persistDismissed(store.dismissedTopics);
-        renderWidget(ctx);
+        requestRender(ctx);
       }
       return { consume: true };
     }
@@ -212,7 +270,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     try {
       if (!event || typeof event !== "object") return;
       counter.recordStep();
-      renderWidget(ctx); // keeps the HUD fresh after heads_up and store changes
+      requestRender(ctx); // keeps the HUD fresh after heads_up and store changes
       maybeStartReview(ctx);
     } catch {
       // never throw into the runtime
@@ -241,7 +299,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       });
       if (gen !== generation) return; // session replaced mid-review
       for (const note of notes) store.add(note);
-      renderWidget(ctx);
+      requestRender(ctx);
     } catch {
       // Quiet failure by design: reviewer/model problems never reach the runtime.
     } finally {
@@ -347,7 +405,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     const newest = store.pending.length > 0 ? store.pending[store.pending.length - 1] : undefined;
     if (!newest || newest.topic !== note.topic) return;
     expandedTopic = newest.topic;
-    renderWidget(ctx);
+    requestRender(ctx);
   }
 
   function persistDismissed(topics: string[]): Promise<void> {
@@ -377,7 +435,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     expandNote,
     fillEditor,
     persist: () => persistDismissed(store.dismissedTopics),
-    rerender: () => renderWidget(ctxRef),
+    rerender: () => requestRender(ctxRef),
     notify,
     status: statusText,
   });
