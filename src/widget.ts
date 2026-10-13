@@ -8,10 +8,11 @@
  * source of truth (info=accent, warning=warning, critical=error).
  *
  * Width handling: pi's TUI measures display columns with visibleWidth()/
- * truncateToWidth() from @earendil-works/pi-tui, but pi-tui is a transitive
- * (undeclared) dependency of this package, so we deliberately implement
- * conservative CHARACTER-count truncation here instead of importing it.
- * Every produced line is at most `width` characters; glyph widths wider than
+ * truncateToWidth() from @earendil-works/pi-tui. pi-tui is a declared
+ * dependency of this package, but it is used only for input key matching in
+ * index.ts, not width measurement, so we deliberately implement conservative
+ * CHARACTER-count truncation here instead of importing its measuring helpers:
+ * every produced line is at most `width` characters; glyph widths wider than
  * one cell could still overflow, which is acceptable for the plain-ASCII
  * note text the reviewer prompt contract produces.
  */

@@ -21,6 +21,7 @@ import type {
   SessionShutdownEvent,
   ToolExecutionEndEvent,
 } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { DEFAULT_REVIEW_EVERY, loadConfig, saveDismissed, type YskConfig } from "./config.ts";
 import { wireActions } from "./actions.ts";
 import { NoteStore, type Note } from "./notes.ts";
@@ -251,7 +252,11 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
             render: () => lines,
             invalidate: () => {},
             handleInput: (data: string) => {
-              if (data === "\x1b") done(undefined);
+              // matchesKey normalizes ESC across legacy (\x1b), kitty
+              // keyboard protocol (\x1b[27u), and modifyOtherKeys encodings;
+              // a raw byte comparison only sees the legacy form. Ctrl+C is
+              // handled too so the focused overlay cannot trap it.
+              if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) done(undefined);
             },
           };
         },

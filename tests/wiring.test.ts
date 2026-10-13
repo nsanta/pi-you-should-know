@@ -272,6 +272,38 @@ describe("you-should-know wiring", () => {
     expect(headless.ui.custom).not.toHaveBeenCalled();
   });
 
+  it("learn overlay closes on ESC in legacy and kitty keyboard encodings", async () => {
+    const { ctx, ui, commands, tools } = await setup();
+    await addNoteViaTool(tools, "Some assumption");
+    await commands.get("ysk").handler("learn", ctx);
+
+    type OverlayFactory = (
+      tui: unknown,
+      theme: unknown,
+      keybindings: unknown,
+      done: () => void,
+    ) => { handleInput: (data: string) => void };
+    const factory = ui.custom.mock.calls[0]![0] as OverlayFactory;
+
+    // Legacy ESC byte and kitty-protocol CSI-u sequence must both close.
+    for (const esc of ["\x1b", "\x1b[27u"]) {
+      let closed = false;
+      const component = factory(undefined, ctx.ui.theme, undefined, () => {
+        closed = true;
+      });
+      component.handleInput(esc);
+      expect(closed, `ESC sequence ${JSON.stringify(esc)} must close the overlay`).toBe(true);
+    }
+
+    // Regular keys must not close the overlay.
+    let stayedOpen = true;
+    const component = factory(undefined, ctx.ui.theme, undefined, () => {
+      stayedOpen = false;
+    });
+    component.handleInput("x");
+    expect(stayedOpen).toBe(true);
+  });
+
   it("/ysk known persists the dismissal into the project config", async () => {
     const { ctx, commands, tools } = await setup();
     await addNoteViaTool(tools, "Deployment gate is manual");
