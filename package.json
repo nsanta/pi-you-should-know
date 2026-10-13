@@ -11,7 +11,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "^1.2.0",
     "typebox": "^1.0.0"
   },
   "devDependencies": {

@@ -87,8 +87,8 @@ describe("wireActions", () => {
     store.replacePending(pendingNotes);
     const deps: ActionDeps = {
       store,
-      showOverlay: vi.fn(),
-      sendChat: vi.fn(),
+      expandNote: vi.fn(),
+      fillEditor: vi.fn(),
       persist: vi.fn(),
       rerender: vi.fn(),
       notify: vi.fn(),
@@ -106,8 +106,8 @@ describe("wireActions", () => {
       pi as never,
       {
         store: new NoteStore(),
-        showOverlay: vi.fn(),
-        sendChat: vi.fn(),
+        expandNote: vi.fn(),
+        fillEditor: vi.fn(),
         persist: vi.fn(),
         rerender: vi.fn(),
         notify: vi.fn(),
@@ -119,23 +119,23 @@ describe("wireActions", () => {
     expect(completions).toContainEqual(expect.objectContaining({ value: "learn" }));
   });
 
-  it("learn shows the newest note's overlay by default", async () => {
+  it("learn expands the newest note by default", async () => {
     const { deps, handler } = setup([note("a"), note("b")]);
     await handler("learn", {});
-    expect(deps.showOverlay).toHaveBeenCalledOnce();
-    expect((deps.showOverlay as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toMatchObject({ topic: "b" });
+    expect(deps.expandNote).toHaveBeenCalledOnce();
+    expect((deps.expandNote as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toMatchObject({ topic: "b" });
   });
 
   it("learn resolves a 1-based index", async () => {
     const { deps, handler } = setup([note("a"), note("b")]);
     await handler("learn 1", {});
-    expect((deps.showOverlay as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toMatchObject({ topic: "a" });
+    expect((deps.expandNote as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toMatchObject({ topic: "a" });
   });
 
   it("learn warns when there is nothing to show", async () => {
     const { deps, handler } = setup([]);
     await handler("learn", {});
-    expect(deps.showOverlay).not.toHaveBeenCalled();
+    expect(deps.expandNote).not.toHaveBeenCalled();
     expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("No pending"), "warning");
   });
 
@@ -149,13 +149,14 @@ describe("wireActions", () => {
     expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("loud-topic"), "info");
   });
 
-  it("chat sends the note framed for the main session", async () => {
+  it("chat fills the editor with the note framed for manual sending", async () => {
     const { deps, handler } = setup([note("assumption")]);
     await handler("chat", {});
-    expect(deps.sendChat).toHaveBeenCalledOnce();
-    const text = (deps.sendChat as ReturnType<typeof vi.fn>).mock.calls[0]![0] as string;
+    expect(deps.fillEditor).toHaveBeenCalledOnce();
+    const text = (deps.fillEditor as ReturnType<typeof vi.fn>).mock.calls[0]![0] as string;
     expect(text).toContain("Re: heads-up — please address");
-    expect(text).toContain("Title: assumption");
+    expect(text).toContain("Detail for assumption");
+    expect(deps.notify).toHaveBeenCalledWith("Note copied to the prompt — review and send when ready.", "info");
   });
 
   it("dismiss hides the note for the session without persisting", async () => {

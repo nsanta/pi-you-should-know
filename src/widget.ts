@@ -17,14 +17,11 @@
  * line, blank row, and the expanded action hint. `KEY_ACTIONS` is the single
  * source of truth for the action key labels so index.ts never hardcodes them.
  *
- * Width handling: pi's TUI measures display columns with visibleWidth()/
- * truncateToWidth() from @earendil-works/pi-tui. pi-tui is a declared
- * dependency of this package, but it is used only for input key matching in
- * index.ts, not width measurement, so we deliberately implement conservative
- * CHARACTER-count truncation here instead of importing its measuring helpers:
- * every produced line is at most `width` characters; glyph widths wider than
- * one cell could still overflow, which is acceptable for the plain-ASCII
- * note text the reviewer prompt contract produces.
+ * Width handling: we deliberately implement conservative CHARACTER-count
+ * truncation: every produced line is at most `width` characters. Glyph
+ * widths wider than one terminal cell could still overflow, which is
+ * acceptable for the plain-ASCII note text the reviewer prompt contract
+ * produces.
  */
 
 import { type Note, type Severity } from "./notes.ts";

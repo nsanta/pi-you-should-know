@@ -5,8 +5,8 @@
  * sends a bounded transcript digest to a nested model call
  * (ctx.modelRegistry.streamSimple) and surfaces findings as non-blocking
  * HUD notes above the prompt. Core logic (step counting, reviewing, the
- * note store) runs in every mode; only widget/overlay/notification touches
- * are guarded behind ctx.hasUI / ctx.mode === "tui".
+ * note store) runs in every mode; only widget, editor-fill, terminal-input,
+ * and notification touches are guarded behind ctx.hasUI / ctx.mode === "tui".
  *
  * Failure policy: quiet by design. A broken reviewer, a missing model, or a
  * widget hiccup must never throw into the runtime; /ysk status is the
@@ -21,14 +21,13 @@ import type {
   SessionShutdownEvent,
   ToolExecutionEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey } from "@earendil-works/pi-tui";
 import { DEFAULT_REVIEW_EVERY, loadConfig, saveDismissed, type YskConfig } from "./config.ts";
 import { wireActions } from "./actions.ts";
 import { formatNotesForChat, NoteStore, type Note } from "./notes.ts";
 import { buildDigest, runReviewer, type ReviewerRequest } from "./reviewer.ts";
 import { StepCounter } from "./steps.ts";
 import { registerHeadsUpTool } from "./tool.ts";
-import { KEY_ACTIONS, severityColorToken, severityLabel, truncateLine, widgetLines } from "./widget.ts";
+import { KEY_ACTIONS, severityColorToken, widgetLines } from "./widget.ts";
 
 const WIDGET_ID = "ysk";
 const USER_CONFIG_PATH = "~/.pi/agent/you-should-know.json";
@@ -196,7 +195,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     }
     if (data === (expanded ? KEY_ACTIONS.expanded.chat : KEY_ACTIONS.collapsed.known)) {
       if (expanded) {
-        fillEditor(newest); // prompt fill only: never sends, never dismisses
+        fillEditor(composedNoteText(newest)); // prompt fill only: never sends, never dismisses
       } else {
         store.dismissPermanently(newest.topic);
         void persistDismissed(store.dismissedTopics);
@@ -205,17 +204,6 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       return { consume: true };
     }
     return undefined;
-  }
-
-  /** Fill the prompt editor with the chat-composed explanation (TUI-only). */
-  function fillEditor(note: Note): void {
-    const ctx = ctxRef;
-    if (!ctx || !ctx.hasUI) return;
-    try {
-      ctx.ui.setEditorText(`Re: heads-up — please address\n\n${formatNotesForChat([note])}`);
-    } catch {
-      // editor fill is best-effort and must never crash the session
-    }
   }
 
   // --- review cadence ------------------------------------------------------
@@ -325,51 +313,41 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   }
 
   /**
-   * Learn-more overlay: full note detail above the editor (TUI-only per the
-   * overlay contract; ESC closes). Headless and RPC modes skip it.
+   * Composed chat framing for one note, shared by the expanded '2' key and
+   * /ysk chat: the text lands in the editor for manual review and sending.
    */
-  async function showOverlay(note: Note): Promise<void> {
+  function composedNoteText(note: Note): string {
+    return `Re: heads-up — please address\n\n${formatNotesForChat([note])}`;
+  }
+
+  /**
+   * Fill the prompt editor with the given text. hasUI-guarded and quiet on
+   * failure; nothing is ever auto-sent — the user reviews and sends.
+   */
+  function fillEditor(text: string): void {
     const ctx = ctxRef;
-    if (!ctx || !ctx.hasUI || ctx.mode !== "tui") return;
+    if (!ctx || !ctx.hasUI) return;
     try {
-      await ctx.ui.custom<void>(
-        (_tui, theme, _keybindings, done) => {
-          const title = note.title.trim().length > 0 ? note.title.trim() : note.topic;
-          const detailLines =
-            typeof note.detail === "string" && note.detail.trim().length > 0 ? note.detail.trim().split("\n") : [];
-          const lines = [
-            theme.fg("muted", "you-should-know"),
-            theme.fg(severityColorToken(note.severity), `[${severityLabel(note.severity)}] ${title}`),
-            "",
-            ...detailLines,
-            "",
-            theme.fg("muted", "ESC to close"),
-          ].map((line) => truncateLine(line, DEFAULT_WIDGET_WIDTH));
-          return {
-            render: () => lines,
-            invalidate: () => {},
-            handleInput: (data: string) => {
-              // matchesKey normalizes ESC across legacy (\x1b), kitty
-              // keyboard protocol (\x1b[27u), and modifyOtherKeys encodings;
-              // a raw byte comparison only sees the legacy form. Ctrl+C is
-              // handled too so the focused overlay cannot trap it.
-              if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) done(undefined);
-            },
-          };
-        },
-        { overlay: true },
-      );
+      ctx.ui.setEditorText(text);
     } catch {
-      // overlay failures are quiet by design
+      // editor fill is best-effort and must never crash the session
     }
   }
 
-  function sendChat(text: string): void {
-    try {
-      pi.sendUserMessage(text);
-    } catch {
-      // quiet: e.g. sendUserMessage unsupported in the current mode
-    }
+  /**
+   * /ysk learn adapter: expand the widget band to this note's full detail,
+   * in place, sharing the key layer's expansion state. Only the newest
+   * pending note can be expanded (the band renders one note); anything
+   * else is a quiet no-op. Headless contexts never render, so this also
+   * refuses to touch the state there.
+   */
+  function expandNote(note: Note): void {
+    const ctx = ctxRef;
+    if (!ctx || !ctx.hasUI) return;
+    const newest = store.pending.length > 0 ? store.pending[store.pending.length - 1] : undefined;
+    if (!newest || newest.topic !== note.topic) return;
+    expandedTopic = newest.topic;
+    renderWidget(ctx);
   }
 
   function persistDismissed(topics: string[]): Promise<void> {
@@ -396,8 +374,8 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
 
   wireActions(pi, {
     store,
-    showOverlay,
-    sendChat,
+    expandNote,
+    fillEditor,
     persist: () => persistDismissed(store.dismissedTopics),
     rerender: () => renderWidget(ctxRef),
     notify,

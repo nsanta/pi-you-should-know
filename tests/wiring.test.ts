@@ -185,7 +185,7 @@ describe("you-should-know wiring", () => {
     expect(ui.setWidget).toHaveBeenCalledWith("ysk", undefined, { placement: "aboveEditor" });
   });
 
-  it("is headless-safe: no widget or overlay calls, review still runs", async () => {
+  it("is headless-safe: no UI calls, review still runs", async () => {
     const { ui, registry, handlers, ctx } = await setup({ config: { reviewEvery: 1 }, hasUI: false });
     handlers.get("tool_execution_end")![0](toolEndEvent("a"), ctx);
     await flush();
@@ -283,49 +283,61 @@ describe("you-should-know wiring", () => {
     expect(result.isError).toBe(true);
   });
 
-  it("/ysk learn opens the overlay only with a TUI-capable context", async () => {
+  it("/ysk learn expands the newest note in place and no /ysk action opens an overlay", async () => {
     const { ctx, ui, commands, tools } = await setup();
     await addNoteViaTool(tools, "Some assumption");
     await commands.get("ysk").handler("learn", ctx);
-    expect(ui.custom).toHaveBeenCalledOnce();
-    expect(ui.custom.mock.calls[0]![1]).toMatchObject({ overlay: true });
+    const expanded = String(lastWidgetArg(ui));
+    expect(expanded).toContain("Understood");
+    expect(expanded).toContain("Some assumption");
+    expect(expanded).not.toContain("Learn more");
 
-    const headless = await setup({ hasUI: false });
-    await addNoteViaTool(headless.tools, "Another assumption");
-    await headless.commands.get("ysk").handler("learn", headless.ctx);
-    expect(headless.ui.custom).not.toHaveBeenCalled();
+    // Expansion is newest-only: an older note is a quiet no-op.
+    const two = await setup();
+    await addNoteViaTool(two.tools, "Older note");
+    await addNoteViaTool(two.tools, "Newest note");
+    two.handlers.get("tool_execution_end")![0](toolEndEvent("ysk-older"), two.ctx);
+    expect(String(lastWidgetArg(two.ui))).toContain("Learn more");
+    await two.commands.get("ysk").handler("learn 1", two.ctx);
+    const collapsed = String(lastWidgetArg(two.ui));
+    expect(collapsed).toContain("Learn more");
+    expect(collapsed).not.toContain("Understood");
+
+    // The modal overlay is gone: no /ysk action may touch ui.custom.
+    await commands.get("ysk").handler("status", ctx);
+    await commands.get("ysk").handler("chat", ctx);
+    await commands.get("ysk").handler("dismiss", ctx);
+    expect(ui.custom).not.toHaveBeenCalled();
   });
 
-  it("learn overlay closes on ESC in legacy and kitty keyboard encodings", async () => {
-    const { ctx, ui, commands, tools } = await setup();
+  it("headless /ysk learn does nothing UI-wise and does not throw", async () => {
+    const { ctx, ui, commands, tools } = await setup({ hasUI: false });
     await addNoteViaTool(tools, "Some assumption");
-    await commands.get("ysk").handler("learn", ctx);
+    await expect(commands.get("ysk").handler("learn", ctx)).resolves.toBeUndefined();
+    expect(ui.setWidget).not.toHaveBeenCalled();
+    expect(ui.custom).not.toHaveBeenCalled();
+    expect(ui.setEditorText).not.toHaveBeenCalled();
+    expect(ui.notify).not.toHaveBeenCalled();
+  });
 
-    type OverlayFactory = (
-      tui: unknown,
-      theme: unknown,
-      keybindings: unknown,
-      done: () => void,
-    ) => { handleInput: (data: string) => void };
-    const factory = ui.custom.mock.calls[0]![0] as OverlayFactory;
+  it("expanded '2' and /ysk chat fill the editor with the same text, never auto-sending", async () => {
+    const { ctx, ui, commands, handler, sent } = await setupWithPendingNote(
+      {},
+      "Deployment gate is manual\ndetail body",
+      "warning",
+    );
+    handler("1"); // expand
+    handler("2"); // key-layer editor fill
+    expect(ui.setEditorText).toHaveBeenCalledOnce();
+    const keyText = ui.setEditorText.mock.calls[0]![0] as string;
+    expect(keyText).toContain("Re: heads-up — please address");
+    expect(keyText).toContain("Deployment gate is manual");
+    expect(keyText).toContain("detail body");
 
-    // Legacy ESC byte and kitty-protocol CSI-u sequence must both close.
-    for (const esc of ["\x1b", "\x1b[27u"]) {
-      let closed = false;
-      const component = factory(undefined, ctx.ui.theme, undefined, () => {
-        closed = true;
-      });
-      component.handleInput(esc);
-      expect(closed, `ESC sequence ${JSON.stringify(esc)} must close the overlay`).toBe(true);
-    }
-
-    // Regular keys must not close the overlay.
-    let stayedOpen = true;
-    const component = factory(undefined, ctx.ui.theme, undefined, () => {
-      stayedOpen = false;
-    });
-    component.handleInput("x");
-    expect(stayedOpen).toBe(true);
+    await commands.get("ysk").handler("chat", ctx);
+    expect(ui.setEditorText).toHaveBeenCalledTimes(2);
+    expect(ui.setEditorText.mock.calls[1]![0]).toBe(keyText); // identical composition
+    expect(sent).toHaveLength(0); // no pi.sendUserMessage anywhere
   });
 
   it("/ysk known persists the dismissal into the project config", async () => {
@@ -335,13 +347,16 @@ describe("you-should-know wiring", () => {
     expect(readProjectConfig().dismissedTopics).toContain("deployment gate is manual");
   });
 
-  it("/ysk chat frames the note for the main session", async () => {
-    const { ctx, commands, tools, sent } = await setup();
+  it("/ysk chat fills the editor instead of sending to the session", async () => {
+    const { ctx, ui, commands, tools, sent } = await setup();
     await addNoteViaTool(tools, "Deployment gate is manual");
     await commands.get("ysk").handler("chat", ctx);
-    expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Re: heads-up — please address");
-    expect(sent[0]).toContain("Deployment gate is manual");
+    expect(ui.setEditorText).toHaveBeenCalledOnce();
+    const text = ui.setEditorText.mock.calls[0]![0] as string;
+    expect(text).toContain("Re: heads-up — please address");
+    expect(text).toContain("Deployment gate is manual");
+    expect(ui.notify).toHaveBeenCalledWith("Note copied to the prompt — review and send when ready.", "info");
+    expect(sent).toHaveLength(0);
   });
 
   it("/ysk dismiss hides for the session without persisting", async () => {

@@ -3,10 +3,10 @@
  *
  * Parsing (`parseYskArgs`) and note selection (`resolveNote`) are pure.
  * `wireActions` registers the /ysk command and delegates every side effect
- * to injected dependencies (store, overlay, chat, persistence, rendering,
- * notifications, status text), so the routing logic is testable without a
- * terminal or a session. The learn overlay and the chat senders themselves
- * are implemented in index.ts (T5 wiring), not here.
+ * to injected dependencies (store, expansion, editor fill, persistence,
+ * rendering, notifications, status text), so the routing logic is testable
+ * without a terminal or a session. The expansion and editor-fill adapters
+ * themselves are implemented in index.ts, not here.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -80,10 +80,16 @@ export interface ActionDeps {
     dismissPermanently(topic: string): void;
     isDismissed(topic: string): boolean;
   };
-  /** Show the learn-more overlay for one note (implemented in index.ts). */
-  showOverlay: (note: Note) => void | Promise<void>;
-  /** Send composed text into the main session chat (implemented in index.ts). */
-  sendChat: (text: string) => void | Promise<void>;
+  /**
+   * Expand one note in the HUD widget band, in place (implemented in
+   * index.ts; acts only on the newest pending note, no-op otherwise).
+   */
+  expandNote: (note: Note) => void;
+  /**
+   * Fill the prompt editor with composed text; the user reviews and sends
+   * it manually (implemented in index.ts; nothing is auto-sent).
+   */
+  fillEditor: (text: string) => void;
   /** Persist the permanently dismissed topics (saveDismissed adapter). */
   persist: () => void | Promise<void>;
   /** Refresh the HUD widget after dismissals. */
@@ -117,7 +123,7 @@ export function wireActions(pi: ExtensionAPI, deps: ActionDeps): void {
 
       switch (parsed.action) {
         case "learn":
-          await deps.showOverlay(note);
+          deps.expandNote(note);
           return;
         case "known":
           deps.store.dismissPermanently(note.topic);
@@ -126,8 +132,8 @@ export function wireActions(pi: ExtensionAPI, deps: ActionDeps): void {
           deps.notify(`Knew this already — "${note.topic}" dismissed permanently.`, "info");
           return;
         case "chat":
-          await deps.sendChat(`Re: heads-up — please address\n\n${formatNotesForChat([note])}`);
-          deps.notify("Note sent to the session chat.", "info");
+          deps.fillEditor(`Re: heads-up — please address\n\n${formatNotesForChat([note])}`);
+          deps.notify("Note copied to the prompt — review and send when ready.", "info");
           return;
         case "dismiss":
           deps.store.dismissSession(note.topic);
