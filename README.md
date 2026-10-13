@@ -13,11 +13,34 @@ and fails quiet by design.
   bounded transcript digest to a nested model call (`ctx.modelRegistry.streamSimple`).
 - The reviewer returns at most 2 notes; notes whose topic was dismissed are dropped
   before they are ever stored.
-- Pending notes (max 3) render as a HUD widget above the editor, severity-colored
-  (`info` → accent, `warning` → warning, `critical` → error), with an action hint line.
+- A pending note becomes visible **when the current agent answer completes**
+  (`agent_end`/`agent_settled`) — mid-loop findings stay queued so the band never
+  interrupts work — and renders as a HUD widget above the editor, severity-colored
+  (`info` → accent, `warning` → warning, `critical` → error).
 - The agent can also record notes directly through the `heads_up` tool.
 - Reviews are fire-and-forget: a slow or broken reviewer never blocks or breaks the
   session. `session_shutdown` and session replacement abort in-flight reviews.
+
+## Note interaction (keyboard)
+
+While a note is displayed above the prompt, single-digit keys act on the **newest**
+note and are consumed (they never reach the editor). Collapsed band:
+
+```
+✦ Heads up · The expiration time a user picks is read in the server's timezone, …
+1: Learn more   2: Knew this already   0: Dismiss
+```
+
+| Key | Effect |
+| --- | --- |
+| `1` | Expand the full explanation **in place** (same band): title, detail lines, and `1: Understood  2: Chat in main session  0: Dismiss`. |
+| `1` (expanded) | Understood — collapse back to the summary band; the note stays pending. |
+| `2` (expanded) | Fill the prompt editor with the composed explanation — you review/edit and press Enter yourself; nothing is sent automatically. |
+| `2` (collapsed) | "Knew this already": dismiss the topic permanently (persisted). |
+| `0` | Dismiss the note for this session only. |
+
+Keys work only in TUI mode with a pending note; typed digits pass through untouched
+when no note is displayed or when input is multi-character (paste-safe).
 
 ## Install
 
@@ -65,12 +88,14 @@ union of both:
 
 ## `/ysk` actions
 
+The `/ysk` command set stays as a fallback (discovery, scripting, older notes):
+
 | Command | Effect |
 | --- | --- |
 | `/ysk` or `/ysk status` | Multi-line status: cadence, steps since last review, in-flight flag, pending count, dismissed count. |
-| `/ysk learn [n]` | Full-detail overlay for a note (ESC closes). |
+| `/ysk learn [n]` | Expand the note **in place** in the widget band (same state as key `1`). |
 | `/ysk known [n]` | "Knew this already": dismiss the topic **permanently** (persisted); the reviewer will skip it from now on. |
-| `/ysk chat [n]` | Compose the note into a user message ("Re: heads-up — please address") for the main session. |
+| `/ysk chat [n]` | Fill the prompt editor with the composed note ("Re: heads-up — please address"); you review and send it yourself. |
 | `/ysk dismiss [n]` | Hide the note for **this session only** (not persisted). |
 
 Notes are addressed newest-first by default; `n` is a 1-based index in the widget's
