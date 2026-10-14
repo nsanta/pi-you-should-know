@@ -10,7 +10,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { formatNotesForChat, type Note } from "./notes.ts";
+import { formatNotesForChat, type Note, type Severity } from "./notes.ts";
 
 /** The /ysk sub-actions. Unknown input falls back to "status". */
 export type YskAction = "learn" | "known" | "chat" | "dismiss" | "status" | "popup";
@@ -82,10 +82,11 @@ export interface ActionDeps {
   };
   /**
    * Open the note popup: a single note opens its detail stage directly, the
-   * { all: true } target opens the list of every pending note (implemented
-   * in index.ts; no-op without a TUI).
+   * { all: true } or { severity } targets open the list of the matching
+   * pending notes, newest first (implemented in index.ts; no-op without a
+   * TUI).
    */
-  openPopup: (target: Note | { all: true }) => void;
+  openPopup: (target: Note | { all: true } | { severity: Severity }) => void;
   /**
    * Mark one note processed for this session: it leaves the pending tally
    * (still reachable via /ysk status; permanent dismissal stays /ysk known).

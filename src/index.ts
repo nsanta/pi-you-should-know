@@ -33,16 +33,17 @@ import type {
 import { matchesKey } from "@earendil-works/pi-tui";
 import { DEFAULT_REVIEW_EVERY, loadConfig, saveDismissed, type YskConfig } from "./config.ts";
 import { wireActions } from "./actions.ts";
-import { formatNotesForChat, NoteStore, type Note } from "./notes.ts";
+import { formatNotesForChat, NoteStore, type Note, type Severity } from "./notes.ts";
 import { buildDigest, runReviewer, type ReviewerRequest } from "./reviewer.ts";
 import { StepCounter } from "./steps.ts";
 import { registerHeadsUpTool } from "./tool.ts";
 import {
   POPUP_ACTIONS,
+  noteIndexAtPopupRow,
   popupActionAtRow,
   popupDetailRows,
   popupListRows,
-  noteIndexAtPopupRow,
+  severityAtSidebarRow,
   severityColorToken,
   sidebarRows,
   type WidgetLine,
@@ -76,8 +77,8 @@ interface OverlayHandleLike {
   getBounds(): { row: number; col: number; width: number; height: number } | undefined;
 }
 
-/** What a popup shows: every pending note (list stage) or one note (detail). */
-type PopupTarget = Note | { all: true };
+/** What a popup shows: every pending note, one severity's notes, or one note. */
+type PopupTarget = Note | { all: true } | { severity: Severity };
 
 /** Popup component state: the list stage or the detail stage. */
 type PopupStage = { kind: "list"; notes: Note[] } | { kind: "detail"; note: Note };
@@ -146,13 +147,14 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
    * close the right-edge overlay so it always mirrors the store. Lives on the
    * same gated render path as the popup opens (idle requestRender +
    * loop-boundary flush), so mid-loop arrivals stay deferred behind the dirty
-   * flag. The snapshot is taken before any UI touch and every sidebar frame
+   * flag. Strictly TUI: headless and RPC contexts never touch the overlay.
+   * The snapshot is taken before any UI touch and every sidebar frame
    * renders from it, so a frame redraw can never leak newer store state.
    */
   function writeSidebar(ctx: ExtensionContext | null): void {
     if (!ctx) return;
     try {
-      if (!ctx.hasUI) return;
+      if (!ctx.hasUI || ctx.mode !== "tui") return;
       sidebarSnapshot = sidebarRows(store.pending, { width: SIDEBAR_WIDTH });
       if (sidebarSnapshot.length === 0) {
         // Empty tally and an open overlay: close it through pi's own done
@@ -183,13 +185,15 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   }
 
   /**
-   * Open the tally sidebar as a non-capturing right-center overlay. The
+   * Open the sidebar as a non-capturing right-center overlay. TUI-only: the
+   * open path refuses headless and RPC contexts even if called directly. The
    * custom() promise is fire-and-forget with a quiet catch; done is captured
    * inside the factory so the empty-snapshot path can close the overlay
    * through pi later. Every deferred callback is generation-guarded: a stale
    * session must not open, repaint, or capture UI state.
    */
   function openSidebar(ctx: ExtensionContext): void {
+    if (!ctx.hasUI || ctx.mode !== "tui") return;
     const gen = generation;
     void ctx.ui.custom(
       (tui, theme, _keybindings, done) => {
@@ -203,8 +207,15 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
           },
           invalidate: () => {},
           handleMouse: (event) => {
-            void event; // the sidebar stays inert: the popup owns interaction
-            return undefined;
+            if (gen !== generation) return undefined;
+            if (event?.type !== "click" || event.button !== "left") return undefined;
+            // Click routing: row text decides what a click selects. The
+            // overlay is nonCapturing, so opening the popup never steals
+            // focus from the editor beforehand — the popup captures its own.
+            const hit = severityAtSidebarRow(sidebarSnapshot, event.y);
+            if (hit === null) return undefined;
+            openPopup(hit === "all" ? { all: true } : { severity: hit });
+            return { handled: true };
           },
         };
       },
@@ -279,18 +290,26 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   /**
    * Open the note popup as a capturing centered overlay. TUI-only: headless
    * and RPC contexts never open anything. One popup at a time — an open
-   * popup is closed through its captured done first. Stage selection: more
-   * than one target note shows the list stage, exactly one shows the detail
-   * stage directly. The notes are snapshotted up front (never re-read from
-   * the live store while the popup is open), and every frame renders from
-   * that snapshot.
+   * popup is closed through its captured done first. Target notes: { all }
+   * or { severity } filter the pending store, a single Note targets itself.
+   * The list stage is NEWEST FIRST (store order reversed); exactly one
+   * match skips the list and opens the detail stage directly. The notes are
+   * snapshotted up front (never re-read from the live store while the popup
+   * is open), and every frame renders from that snapshot.
    */
   function openPopup(target: PopupTarget): void {
     const ctx = ctxRef;
     if (!ctx || !ctx.hasUI || ctx.mode !== "tui") return;
     closePopup(); // exactly one popup at a time
 
-    const notes = (target as { all?: true }).all === true ? store.pending : [target as Note];
+    const matches =
+      (target as { all?: true }).all === true
+        ? store.pending
+        : "topic" in (target as Note)
+          ? [target as Note]
+          : store.pending.filter((note) => note.severity === (target as { severity: Severity }).severity);
+    // List stage reads newest first; a single note is unaffected by the flip.
+    const notes = [...matches].reverse();
     if (notes.length === 0) return;
     let stage: PopupStage =
       notes.length > 1 ? { kind: "list", notes } : { kind: "detail", note: notes[0]! };

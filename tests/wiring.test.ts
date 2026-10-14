@@ -646,7 +646,7 @@ describe("you-should-know tally sidebar overlay", () => {
     expect(ui.custom).not.toHaveBeenCalled();
   });
 
-  it("a stale session's overlay renders nothing and its mouse hook stays inert", async () => {
+  it("a stale session's overlay renders nothing and its mouse hook stays dead", async () => {
     const { customCalls, tools, handlers, ctx } = await setup();
     await addNoteViaTool(tools, "Guard note");
     handlers.get("tool_execution_end")![0](toolEndEvent("s1"), ctx);
@@ -654,11 +654,17 @@ describe("you-should-know tally sidebar overlay", () => {
 
     handlers.get("session_shutdown")![0]({ type: "session_shutdown", reason: "quit" }, ctx);
     // pi may still hold the overlay for a frame after disposal: a stale
-    // generation must never repaint session state.
+    // generation must never repaint session state or open a popup.
     expect(open.component.render?.(100)).toEqual([]);
-    // The sidebar click-routing surface stays inert (the popup is the only
-    // interactive overlay in T3's scope).
     expect(open.component.handleMouse?.({ type: "down" })).toBeUndefined();
+  });
+
+  it("rpc mode never opens the sidebar even with pending notes", async () => {
+    const { ui, tools, handlers, ctx } = await setup({ ctxOverrides: { mode: "rpc" } });
+    await addNoteViaTool(tools, "Rpc note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("rpc-1"), ctx);
+    await flush();
+    expect(ui.custom).not.toHaveBeenCalled();
   });
 });
 
@@ -672,8 +678,8 @@ describe("you-should-know note popup", () => {
     expect(popup.opts?.overlayOptions).toEqual({ anchor: "center", width: "60%", maxHeight: "60%", margin: 1 });
     expect(popup.component.render?.(100)).toEqual([
       "<muted>Heads up",
-      "<warning>1. [warning] Silent assumption",
-      "<error>2. [critical] Hidden decision",
+      "<error>1. [critical] Hidden decision",
+      "<warning>2. [warning] Silent assumption",
       "<muted>number to open · Esc to close",
     ]);
 
@@ -689,11 +695,11 @@ describe("you-should-know note popup", () => {
     ]);
   });
 
-  it("list stage: pressing a note number switches to that note's detail rows", async () => {
+  it("list stage: pressing a note number switches to that note's detail rows (row 1 is the newest)", async () => {
     const { popup } = await setupWithPopup(["First note", "Second note"]);
     popup.component.handleInput!("1");
     const rows = popup.component.render?.(100) ?? [];
-    expect(rows.join("\n")).toContain("Heads up · First note");
+    expect(rows.join("\n")).toContain("Heads up · Second note"); // newest first
     expect(rows.join("\n")).not.toContain("number to open");
   });
 
@@ -751,12 +757,13 @@ describe("you-should-know note popup", () => {
 
   it("handleMouse picks a list row and fires the trailing detail action rows", async () => {
     const { popup, ui } = await setupWithPopup(["Silent assumption", "Hidden decision"], ["warning", "critical"]);
-    popup.component.handleMouse!(clickEvent(1)); // "1. [warning] Silent assumption"
-    expect(renderOf(popup)).toContain("Heads up · Silent assumption"); // switched to detail
+    popup.component.handleMouse!(clickEvent(1)); // "1. [critical] Hidden decision" (newest first)
+    expect(renderOf(popup)).toContain("Heads up · Hidden decision"); // switched to detail
 
     // Detail rows: header(0), blank(1), detail(2), blank(3), then the 3-row hint block.
     popup.component.handleMouse!(clickEvent(5)); // "2: Chat in main session"
     expect(ui.setEditorText).toHaveBeenCalledOnce();
+    expect((ui.setEditorText.mock.calls[0]![0] as string)).toContain("Hidden decision");
     expect(popup.resolve).toHaveBeenCalledTimes(1); // chat closes the popup
   });
 
@@ -816,5 +823,59 @@ describe("you-should-know note popup", () => {
     await commands.get("ysk").handler("status", ctx);
     expect(ui.custom.mock.calls).toHaveLength(opensBefore);
     expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("pending notes: 1"), "info");
+  });
+
+  it("clicking a sidebar severity row opens the filtered popup; the header opens all", async () => {
+    const { ctx, ui, customCalls, tools, handlers } = await setup();
+    await addNoteViaTool(tools, "Warning one", "warning");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s1"), ctx);
+    await addNoteViaTool(tools, "Warning two", "warning");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s2"), ctx);
+    await addNoteViaTool(tools, "Critical note", "critical");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s3"), ctx);
+    expect(ui.custom).toHaveBeenCalledTimes(1); // only the sidebar so far
+    const sidebar = customCalls[0]!;
+
+    // Header click -> all notes, list stage, newest first.
+    sidebar.component.handleMouse!(clickEvent(0));
+    expect(ui.custom).toHaveBeenCalledTimes(2);
+    expect(customCalls[1]!.component.render?.(100)).toEqual([
+      "<muted>Heads up",
+      "<error>1. [critical] Critical note",
+      "<warning>2. [warning] Warning two",
+      "<warning>3. [warning] Warning one",
+      "<muted>number to open · Esc to close",
+    ]);
+
+    // Severity row click -> exactly that severity; the previous popup closed first.
+    sidebar.component.handleMouse!(clickEvent(2)); // "■ 2 warning"
+    expect(customCalls[1]!.resolve).toHaveBeenCalledTimes(1);
+    expect(customCalls[2]!.component.render?.(100)).toEqual([
+      "<muted>Heads up",
+      "<warning>1. [warning] Warning two",
+      "<warning>2. [warning] Warning one",
+      "<muted>number to open · Esc to close",
+    ]);
+  });
+
+  it("a severity filter with exactly one match opens the detail stage directly", async () => {
+    const { ctx, ui, customCalls, tools, handlers } = await setup();
+    await addNoteViaTool(tools, "Lone warning", "warning");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s1"), ctx);
+    await addNoteViaTool(tools, "A critical", "critical");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s2"), ctx);
+    const sidebar = customCalls[0]!;
+
+    sidebar.component.handleMouse!(clickEvent(2)); // "■ 1 warning"
+    expect(ui.custom).toHaveBeenCalledTimes(2);
+    expect(customCalls[1]!.component.render?.(100)).toEqual([
+      "<warning>Heads up · Lone warning",
+      "<accent>",
+      "<accent>Lone warning",
+      "<accent>",
+      "<muted>1: Understood",
+      "<muted>2: Chat in main session",
+      "<muted>0: Dismiss",
+    ]);
   });
 });
