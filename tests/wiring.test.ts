@@ -76,7 +76,12 @@ function fakeModelRegistry(outcome: StreamOutcome = {}) {
 
 /** One recorded ui.custom overlay open: the component plus its contract pieces. */
 interface RecordedCustomOpen {
-  component: { render?: (width?: number) => string[]; invalidate?: () => void; handleMouse?: (event: unknown) => unknown };
+  component: {
+    render?: (width?: number) => string[];
+    invalidate?: () => void;
+    handleInput?: (data: string) => void;
+    handleMouse?: (event: unknown) => unknown;
+  };
   opts: Record<string, unknown> | undefined;
   fakeTui: { requestRender: ReturnType<typeof vi.fn> };
   /** Spy-wrapped done/resolve: invoking it resolves the overlay promise. */
@@ -87,8 +92,6 @@ function mockCtx(
   registry: ReturnType<typeof fakeModelRegistry>,
   overrides: Record<string, unknown> = {},
 ) {
-  /** One unique unsubscribe spy per onTerminalInput subscription. */
-  const unsubscribers: Array<ReturnType<typeof vi.fn>> = [];
   /** Every ui.custom open, in order, with the pieces the overlay contract hands out. */
   const customCalls: RecordedCustomOpen[] = [];
   /** OverlayHandle stand-in handed to every open's onHandle. */
@@ -117,11 +120,6 @@ function mockCtx(
           customCalls.push({ component, opts, fakeTui: fakeOverlayTui, resolve: done });
         }),
     ),
-    onTerminalInput: vi.fn((_handler: unknown) => {
-      const unsubscribe = vi.fn();
-      unsubscribers.push(unsubscribe);
-      return unsubscribe;
-    }),
     theme: { fg: vi.fn((token: string, text: string) => `<${token}>${text}`) },
   };
   const ctx: any = {
@@ -136,7 +134,7 @@ function mockCtx(
     model: { provider: "sess", id: "session-model" },
     ...overrides,
   };
-  return { ctx, ui, unsubscribers, customCalls, fakeOverlayTui, fakeHandle };
+  return { ctx, ui, customCalls, fakeOverlayTui, fakeHandle };
 }
 
 async function setup(
@@ -165,7 +163,7 @@ async function setup(
     },
   };
   const registry = fakeModelRegistry(options.outcome);
-  const { ctx, ui, unsubscribers, customCalls, fakeOverlayTui, fakeHandle } = mockCtx(registry, {
+  const { ctx, ui, customCalls, fakeOverlayTui, fakeHandle } = mockCtx(registry, {
     hasUI: options.hasUI ?? true,
     ...options.ctxOverrides,
   });
@@ -175,7 +173,6 @@ async function setup(
     registry,
     ctx,
     ui,
-    unsubscribers,
     customCalls,
     fakeOverlayTui,
     fakeHandle,
@@ -191,85 +188,50 @@ const flush = async (): Promise<void> => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 };
 
-const widgetCalls = (ui: { setWidget: any }): any[][] => ui.setWidget.mock.calls;
-
-/** Fake pi-tui TUI instance handed to a setWidget factory invocation. */
-interface FakeWidgetTui {
-  requestRender: ReturnType<typeof vi.fn>;
-}
-
 /** Stand-in for pi's Theme; output format matches the ctx.ui.theme fake. */
 const fakeTheme = { fg: (token: string, text: string) => `<${token}>${text}` };
 
-/**
- * Resolve one setWidget mock call's content for BOTH overloads. The string
- * overload passes through unchanged; the factory overload is invoked with a
- * fresh fake tui (recorded on the mock call as `fakeTui`) plus the fake
- * theme, and the returned component is rendered once. Resolution is memoized
- * on the call so repeated assertions never re-invoke a factory.
- */
-function resolveWidgetCall(call: any[]): { lines: string[]; tui?: FakeWidgetTui } {
-  const memo = (call as any).resolved as { lines: string[]; tui?: FakeWidgetTui } | undefined;
-  if (memo) return memo;
-  const content = call[1];
-  let resolved: { lines: string[]; tui?: FakeWidgetTui };
-  if (typeof content === "function") {
-    const tui: FakeWidgetTui = { requestRender: vi.fn() };
-    const component = content(tui, fakeTheme) as { render?: (width?: number) => string[] };
-    resolved = { lines: component?.render?.(100) ?? [], tui };
-    (call as any).fakeTui = tui;
-  } else {
-    resolved = { lines: Array.isArray(content) ? content : [], tui: undefined };
-  }
-  (call as any).resolved = resolved;
-  return resolved;
-}
-
-/** Last call's content: raw value for the string overload, resolved lines for factories. */
-const lastWidgetArg = (ui: { setWidget: any }): unknown => {
-  const call = widgetCalls(ui).at(-1);
-  if (!call) return undefined;
-  const content = call[1];
-  if (typeof content === "function") return resolveWidgetCall(call).lines;
-  return content;
-};
-
-/** Fake tui captured by the most recent factory-overload call, if any. */
-const lastWidgetTui = (ui: { setWidget: any }): FakeWidgetTui | undefined => {
-  const calls = widgetCalls(ui);
-  for (let i = calls.length - 1; i >= 0; i--) {
-    if (typeof calls[i]![1] === "function") return resolveWidgetCall(calls[i]!).tui;
-  }
-  return undefined;
-};
-
-const widgetText = (ui: { setWidget: any }): string =>
-  widgetCalls(ui)
-    .map((call) => {
-      const content = call[1];
-      if (typeof content === "function") return resolveWidgetCall(call).lines.join("\n");
-      return Array.isArray(content) ? content.join("\n") : String(content ?? "");
-    })
-    .join("\n");
+/** Themed render of one recorded custom open at a fixed width. */
+const renderOf = (open: RecordedCustomOpen): string => (open.component.render?.(100) ?? []).join("\n");
 
 async function addNoteViaTool(tools: Map<string, any>, note: string, severity?: string): Promise<any> {
   return tools.get("heads_up").execute("id", severity ? { note, severity } : { note });
 }
 
-/** The terminal-input handler registered by the most recent session. */
-const inputHandler = (ui: { onTerminalInput: any }): ((data: string) => { consume?: boolean } | undefined) =>
-  ui.onTerminalInput.mock.calls.at(-1)![0];
+/** Normalized left-click at row y of the receiving component. */
+function clickEvent(y: number): Record<string, unknown> {
+  return {
+    type: "click",
+    button: "left",
+    x: 0,
+    y,
+    screenX: 0,
+    screenY: 0,
+    width: 60,
+    height: 10,
+    shift: false,
+    alt: false,
+    ctrl: false,
+  };
+}
 
-/** Register a pending note and let the runtime render it, then return the key handler. */
-async function setupWithPendingNote(
-  options: Parameters<typeof setup>[0] = {},
-  note = "Deployment gate is manual",
-  severity?: string,
-) {
-  const session = await setup(options);
-  await addNoteViaTool(session.tools, note, severity);
-  session.handlers.get("tool_execution_end")![0](toolEndEvent("ysk-keys"), session.ctx);
-  return { ...session, handler: inputHandler(session.ui) };
+/**
+ * Record notes through the heads_up tool (rendering each), then open the
+ * popup via bare /ysk. customCalls[0] is the tally sidebar; the popup is the
+ * most recent open.
+ */
+async function setupWithPopup(noteTexts: string[], severities?: string[]) {
+  const session = await setup();
+  for (const [index, text] of noteTexts.entries()) {
+    await addNoteViaTool(session.tools, text, severities?.[index]);
+    session.handlers.get("tool_execution_end")![0](toolEndEvent(`p${index}`), session.ctx);
+  }
+  await session.commands.get("ysk").handler("", session.ctx);
+  return {
+    ...session,
+    sidebar: session.customCalls[0]!,
+    popup: session.customCalls.at(-1)!,
+  };
 }
 
 // --- tests -------------------------------------------------------------------
@@ -291,9 +253,9 @@ describe("you-should-know wiring", () => {
     }
   });
 
-  it("session_start loads project config and clears the widget baseline", async () => {
+  it("session_start loads project config and keeps the UI quiet for an empty tally", async () => {
     const { ui } = await setup({ config: { reviewEvery: 2 } });
-    expect(ui.setWidget).toHaveBeenCalledWith("ysk", undefined, { placement: "aboveEditor" });
+    expect(ui.custom).not.toHaveBeenCalled();
   });
 
   it("is headless-safe: no UI calls, review still runs", async () => {
@@ -305,8 +267,8 @@ describe("you-should-know wiring", () => {
     expect(ui.custom).not.toHaveBeenCalled();
   });
 
-  it("runs a background review after reviewEvery steps and surfaces notes on the widget", async () => {
-    const { ui, registry, handlers, ctx } = await setup({ config: { reviewEvery: 2 } });
+  it("runs a background review after reviewEvery steps and surfaces notes on the sidebar", async () => {
+    const { ui, customCalls, registry, handlers, ctx } = await setup({ config: { reviewEvery: 2 } });
 
     handlers.get("tool_execution_end")![0](toolEndEvent("a"), ctx);
     expect(registry.calls()).toHaveLength(0); // below threshold
@@ -314,11 +276,9 @@ describe("you-should-know wiring", () => {
     handlers.get("tool_execution_end")![0](toolEndEvent("b"), ctx);
     await flush();
     expect(registry.calls()).toHaveLength(1);
-    expect(lastWidgetArg(ui)).toEqual([
-      "<error>✦ Heads up · Hidden decision",
-      "<muted>+1 more · /ysk",
-      "<accent>1: Learn more  2: Knew this already  0: Dismiss",
-    ]);
+    expect(ui.custom).toHaveBeenCalledOnce();
+    // Header + one row per non-zero severity, priority order, theme tokens applied.
+    expect(renderOf(customCalls[0]!)).toBe("<accent>✦ 2 heads-up\n<error>■ 1 critical\n<warning>■ 1 warning");
 
     // Counter reset: two more steps trigger exactly one more review.
     handlers.get("tool_execution_end")![0](toolEndEvent("c"), ctx);
@@ -328,11 +288,13 @@ describe("you-should-know wiring", () => {
   });
 
   it("skips dismissed topics before notes reach the store", async () => {
-    const { ui, handlers, ctx } = await setup({ config: { reviewEvery: 1, dismissedTopics: ["silent assumption"] } });
+    const { customCalls, handlers, ctx } = await setup({ config: { reviewEvery: 1, dismissedTopics: ["silent assumption"] } });
     handlers.get("tool_execution_end")![0](toolEndEvent("a"), ctx);
     await flush();
-    expect(widgetText(ui)).toContain("Hidden decision");
-    expect(widgetText(ui)).not.toContain("Silent assumption");
+    const text = renderOf(customCalls[0]!);
+    expect(text).toContain("1 head-up");
+    expect(text).toContain("1 critical");
+    expect(text).not.toContain("warning");
   });
 
   it("guards against concurrent reviews with the in-flight flag", async () => {
@@ -349,7 +311,7 @@ describe("you-should-know wiring", () => {
     const rejecting = await setup({ config: { reviewEvery: 1 }, outcome: { reject: new Error("no network") } });
     rejecting.handlers.get("tool_execution_end")![0](toolEndEvent("a"), rejecting.ctx);
     await flush();
-    expect(lastWidgetArg(rejecting.ui)).toBeUndefined();
+    expect(rejecting.ui.custom).not.toHaveBeenCalled(); // no notes, no sidebar
 
     const errored = await setup({
       config: { reviewEvery: 1 },
@@ -357,7 +319,7 @@ describe("you-should-know wiring", () => {
     });
     errored.handlers.get("tool_execution_end")![0](toolEndEvent("a"), errored.ctx);
     await flush();
-    expect(lastWidgetArg(errored.ui)).toBeUndefined();
+    expect(errored.ui.custom).not.toHaveBeenCalled();
   });
 
   it("session_shutdown aborts the in-flight request and discards its result", async () => {
@@ -371,18 +333,19 @@ describe("you-should-know wiring", () => {
 
     registry.release({ stopReason: "stop", content: [{ type: "text", text: REVIEW_JSON }] });
     await flush();
-    // The late result belongs to a dead generation: never rendered.
-    expect(lastWidgetArg(ui)).toBeUndefined();
+    // The late result belongs to a dead generation: never surfaced.
+    expect(ui.custom).not.toHaveBeenCalled();
   });
 
   it("heads_up records through the store, re-renders, and dedupes", async () => {
-    const { ui, tools, handlers, ctx } = await setup();
+    const { ui, customCalls, tools, handlers, ctx } = await setup();
     const result = await addNoteViaTool(tools, "Deployment gate is manual", "warning");
     expect(result.content[0].text).toContain("Recorded");
     expect(result.details).toMatchObject({ topic: "deployment gate is manual", severity: "warning", added: true });
     // The runtime fires tool_execution_end after the tool; the handler re-renders.
     handlers.get("tool_execution_end")![0](toolEndEvent("ysk-1"), ctx);
-    expect(widgetText(ui)).toContain("Deployment gate is manual");
+    expect(ui.custom).toHaveBeenCalledOnce();
+    expect(renderOf(customCalls[0]!)).toContain("1 head-up");
 
     const duplicate = await addNoteViaTool(tools, "Deployment gate is manual\nrestated with a different body");
     expect(duplicate.details.added).toBe(false);
@@ -394,64 +357,62 @@ describe("you-should-know wiring", () => {
     expect(result.isError).toBe(true);
   });
 
-  it("/ysk learn expands the newest note in place and no /ysk action opens an overlay", async () => {
-    const { ctx, ui, commands, tools } = await setup();
+  it("/ysk learn opens that note's popup while status opens nothing new", async () => {
+    const { ctx, ui, commands, customCalls, tools, handlers } = await setup();
     await addNoteViaTool(tools, "Some assumption");
-    await commands.get("ysk").handler("learn", ctx);
-    const expanded = String(lastWidgetArg(ui));
-    expect(expanded).toContain("Understood");
-    expect(expanded).toContain("Some assumption");
-    expect(expanded).not.toContain("Learn more");
+    handlers.get("tool_execution_end")![0](toolEndEvent("ysk-learn"), ctx);
+    expect(ui.custom).toHaveBeenCalledTimes(1); // the tally sidebar
 
-    // Expansion is newest-only: an older note is a quiet no-op.
+    await commands.get("ysk").handler("learn", ctx); // newest by default
+    expect(ui.custom).toHaveBeenCalledTimes(2);
+    expect(renderOf(customCalls[1]!)).toContain("Heads up · Some assumption");
+
+    // learn <n> targets the 1-based note, not just the newest.
     const two = await setup();
     await addNoteViaTool(two.tools, "Older note");
     await addNoteViaTool(two.tools, "Newest note");
     two.handlers.get("tool_execution_end")![0](toolEndEvent("ysk-older"), two.ctx);
-    expect(String(lastWidgetArg(two.ui))).toContain("Learn more");
     await two.commands.get("ysk").handler("learn 1", two.ctx);
-    const collapsed = String(lastWidgetArg(two.ui));
-    expect(collapsed).toContain("Learn more");
-    expect(collapsed).not.toContain("Understood");
+    expect(renderOf(two.customCalls[1]!)).toContain("Heads up · Older note");
 
-    // The modal popup overlay is gone: no /ysk action may open anything NEW.
-    // (Since T2 the tally sidebar legitimately owns its own ui.custom overlay,
-    // which the renders above already opened; it must stay the only one.)
-    const customOpensBefore = ui.custom.mock.calls.length;
+    // /ysk status only reports: it never opens a popup.
+    const opensBefore = ui.custom.mock.calls.length;
     await commands.get("ysk").handler("status", ctx);
-    await commands.get("ysk").handler("chat", ctx);
-    await commands.get("ysk").handler("dismiss", ctx);
-    expect(ui.custom.mock.calls).toHaveLength(customOpensBefore);
+    expect(ui.custom.mock.calls).toHaveLength(opensBefore);
   });
 
-  it("headless /ysk learn does nothing UI-wise and does not throw", async () => {
+  it("headless /ysk does nothing UI-wise and does not throw", async () => {
     const { ctx, ui, commands, tools } = await setup({ hasUI: false });
     await addNoteViaTool(tools, "Some assumption");
-    await expect(commands.get("ysk").handler("learn", ctx)).resolves.toBeUndefined();
+    await expect(commands.get("ysk").handler("", ctx)).resolves.toBeUndefined();
+    await expect(commands.get("ysk").handler("learn 1", ctx)).resolves.toBeUndefined();
     expect(ui.setWidget).not.toHaveBeenCalled();
     expect(ui.custom).not.toHaveBeenCalled();
     expect(ui.setEditorText).not.toHaveBeenCalled();
     expect(ui.notify).not.toHaveBeenCalled();
   });
 
-  it("expanded '2' and /ysk chat fill the editor with the same text, never auto-sending", async () => {
-    const { ctx, ui, commands, handler, sent } = await setupWithPendingNote(
-      {},
-      "Deployment gate is manual\ndetail body",
-      "warning",
-    );
-    handler("1"); // expand
-    handler("2"); // key-layer editor fill
-    expect(ui.setEditorText).toHaveBeenCalledOnce();
-    const keyText = ui.setEditorText.mock.calls[0]![0] as string;
-    expect(keyText).toContain("Re: heads-up — please address");
-    expect(keyText).toContain("Deployment gate is manual");
-    expect(keyText).toContain("detail body");
+  it("popup '2' and /ysk chat fill the editor with the same text, never auto-sending", async () => {
+    // Popup path: 1 pending -> detail popup, then the Chat action.
+    const viaPopup = await setupWithPopup(["Deployment gate is manual\ndetail body"], ["warning"]);
+    viaPopup.popup.component.handleInput!("2");
+    expect(viaPopup.ui.setEditorText).toHaveBeenCalledOnce();
+    const popupText = viaPopup.ui.setEditorText.mock.calls[0]![0] as string;
 
-    await commands.get("ysk").handler("chat", ctx);
-    expect(ui.setEditorText).toHaveBeenCalledTimes(2);
-    expect(ui.setEditorText.mock.calls[1]![0]).toBe(keyText); // identical composition
-    expect(sent).toHaveLength(0); // no pi.sendUserMessage anywhere
+    // Command path: same note, /ysk chat.
+    const viaCommand = await setup();
+    await addNoteViaTool(viaCommand.tools, "Deployment gate is manual\ndetail body", "warning");
+    viaCommand.handlers.get("tool_execution_end")![0](toolEndEvent("chat-note"), viaCommand.ctx);
+    await viaCommand.commands.get("ysk").handler("chat", viaCommand.ctx);
+    expect(viaCommand.ui.setEditorText).toHaveBeenCalledOnce();
+    const commandText = viaCommand.ui.setEditorText.mock.calls[0]![0] as string;
+
+    expect(popupText).toContain("Re: heads-up — please address");
+    expect(popupText).toContain("Deployment gate is manual");
+    expect(popupText).toContain("detail body");
+    expect(commandText).toBe(popupText); // identical composition
+    expect(viaPopup.sent).toHaveLength(0); // never auto-sends anywhere
+    expect(viaCommand.sent).toHaveLength(0);
   });
 
   it("/ysk known persists the dismissal into the project config", async () => {
@@ -461,29 +422,33 @@ describe("you-should-know wiring", () => {
     expect(readProjectConfig().dismissedTopics).toContain("deployment gate is manual");
   });
 
-  it("/ysk chat fills the editor instead of sending to the session", async () => {
-    const { ctx, ui, commands, tools, sent } = await setup();
+  it("/ysk chat fills the editor, marks the note processed, and closes the emptied sidebar", async () => {
+    const { ctx, ui, commands, customCalls, tools, sent, handlers } = await setup();
     await addNoteViaTool(tools, "Deployment gate is manual");
+    handlers.get("tool_execution_end")![0](toolEndEvent("chat-note"), ctx);
     await commands.get("ysk").handler("chat", ctx);
     expect(ui.setEditorText).toHaveBeenCalledOnce();
     const text = ui.setEditorText.mock.calls[0]![0] as string;
     expect(text).toContain("Re: heads-up — please address");
     expect(text).toContain("Deployment gate is manual");
-    expect(ui.notify).toHaveBeenCalledWith("Note copied to the prompt — review and send when ready.", "info");
+    expect(ui.notify).toHaveBeenCalledWith("Note copied to the prompt — marked as processed.", "info");
     expect(sent).toHaveLength(0);
+    expect(customCalls[0]!.resolve).toHaveBeenCalledTimes(1); // processed last note -> sidebar closes
   });
 
   it("/ysk dismiss hides for the session without persisting", async () => {
-    const { ctx, ui, commands, tools } = await setup();
+    const { ctx, ui, commands, customCalls, tools, handlers } = await setup();
     await addNoteViaTool(tools, "Noisy note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("dismiss-note"), ctx);
     await commands.get("ysk").handler("dismiss", ctx);
-    expect(lastWidgetArg(ui)).toBeUndefined();
+    expect(customCalls[0]!.resolve).toHaveBeenCalledTimes(1); // sidebar closed with the emptied tally
     expect(readProjectConfig().dismissedTopics ?? []).toHaveLength(0);
   });
 
   it("/ysk status reports reviewer state through notifications", async () => {
-    const { ctx, ui, commands, tools } = await setup({ config: { reviewEvery: 3 } });
+    const { ctx, ui, commands, tools, handlers } = await setup({ config: { reviewEvery: 3 } });
     await addNoteViaTool(tools, "Pending note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("status-note"), ctx);
     await commands.get("ysk").handler("status", ctx);
     const statusText = ui.notify.mock.calls.at(-1)![0] as string;
     expect(statusText).toContain("pending notes: 1");
@@ -517,207 +482,71 @@ describe("you-should-know wiring", () => {
     await handlers.get("session_start")![0]({ type: "session_start", reason: "resume" }, ctx);
     registry.release({ stopReason: "stop", content: [{ type: "text", text: REVIEW_JSON }] });
     await flush();
-    expect(lastWidgetArg(ui)).toBeUndefined();
-  });
-
-  // --- terminal-input key layer (T2) -----------------------------------------
-
-  it("subscribes one terminal-input handler per TUI session, unsubscribes on shutdown, re-subscribes on session_start", async () => {
-    const { ui, unsubscribers, handlers, ctx } = await setup();
-    expect(ui.onTerminalInput).toHaveBeenCalledOnce();
-    expect(ui.onTerminalInput.mock.calls[0]![0]).toBeTypeOf("function");
-
-    handlers.get("session_shutdown")![0]({ type: "session_shutdown", reason: "quit" }, ctx);
-    expect(unsubscribers[0]).toHaveBeenCalledOnce();
-
-    // Session replacement: the stale handler is detached before the new one subscribes.
-    await handlers.get("session_start")![0]({ type: "session_start", reason: "resume" }, ctx);
-    expect(ui.onTerminalInput).toHaveBeenCalledTimes(2);
-    expect(unsubscribers[0]).toHaveBeenCalledOnce();
-    expect(unsubscribers[0]!.mock.invocationCallOrder[0]).toBeLessThan(ui.onTerminalInput.mock.invocationCallOrder[1]!);
-  });
-
-  it("never subscribes terminal input outside TUI contexts", async () => {
-    const headless = await setup({ hasUI: false });
-    expect(headless.ui.onTerminalInput).not.toHaveBeenCalled();
-
-    const rpc = await setup({ ctxOverrides: { mode: "rpc" } });
-    expect(rpc.ui.onTerminalInput).not.toHaveBeenCalled();
-  });
-
-  it("collapsed '1' expands the newest note in place and consumes the key", async () => {
-    const { ui, handler } = await setupWithPendingNote();
-    expect(String(lastWidgetArg(ui))).toContain("Learn more");
-
-    expect(handler("1")).toEqual({ consume: true });
-    const expanded = String(lastWidgetArg(ui));
-    expect(expanded).toContain("Understood");
-    expect(expanded).toContain("Deployment gate is manual");
-  });
-
-  it("expanded '2' fills the editor with the composed explanation instead of sending", async () => {
-    const { ui, handler, sent } = await setupWithPendingNote({}, "Deployment gate is manual\ndetail body", "warning");
-    handler("1"); // expand
-
-    expect(handler("2")).toEqual({ consume: true });
-    expect(ui.setEditorText).toHaveBeenCalledOnce();
-    const text = ui.setEditorText.mock.calls[0]![0] as string;
-    expect(text).toContain("Re: heads-up — please address");
-    expect(text).toContain("Deployment gate is manual");
-    expect(text).toContain("detail body");
-    expect(sent).toHaveLength(0); // never auto-sends
-    expect(String(lastWidgetArg(ui))).toContain("Deployment gate is manual"); // note stays pending
-  });
-
-  it("expanded '2' requests a TUI render after filling the editor (stale-screen fix)", async () => {
-    const { ui, customCalls, handler } = await setupWithPendingNote(
-      {},
-      "Deployment gate is manual\ndetail body",
-      "warning",
-    );
-    handler("1"); // expand
-    // The repaint goes to whichever TUI the HUD captured: the sidebar overlay's
-    // (open since the note was presented) or, failing that, the band's.
-    const repaintCount = (): number =>
-      (customCalls.at(-1)?.fakeTui.requestRender.mock.calls.length ?? 0) +
-      (lastWidgetTui(ui)?.requestRender.mock.calls.length ?? 0);
-    const before = repaintCount();
-
-    expect(handler("2")).toEqual({ consume: true });
-    expect(ui.setEditorText).toHaveBeenCalledOnce();
-    // setEditorText alone never repaints; exactly one captured tui must be asked to.
-    expect(repaintCount()).toBe(before + 1);
-  });
-
-  it("headless mode never captures a widget tui: setWidget is never called with a factory", async () => {
-    const { ui, tools, handlers, ctx } = await setup({ hasUI: false });
-    await addNoteViaTool(tools, "Headless note");
-    handlers.get("tool_execution_end")![0](toolEndEvent("ysk-headless"), ctx);
-    await flush();
-    const factories = widgetCalls(ui).filter((call) => typeof call[1] === "function");
-    expect(factories).toHaveLength(0);
-    expect(ui.setWidget).not.toHaveBeenCalled(); // headless semantics unchanged
-  });
-
-  it("expanded '1' acknowledges non-destructively and collapses back", async () => {
-    const { ui, handler } = await setupWithPendingNote();
-    handler("1"); // expand
-
-    expect(handler("1")).toEqual({ consume: true });
-    const collapsed = String(lastWidgetArg(ui));
-    expect(collapsed).toContain("Learn more");
-    expect(collapsed).not.toContain("Understood");
-    expect(collapsed).toContain("Deployment gate is manual"); // note still pending
-    expect(ui.setEditorText).not.toHaveBeenCalled();
-  });
-
-  it("collapsed '2' dismisses permanently and persists through the config path", async () => {
-    const { ui, handler } = await setupWithPendingNote();
-
-    expect(handler("2")).toEqual({ consume: true });
-    await flush();
-    expect(readProjectConfig().dismissedTopics).toContain("deployment gate is manual");
-    expect(lastWidgetArg(ui)).toBeUndefined(); // widget cleared
-  });
-
-  it("collapsed '0' dismisses for the session without persisting", async () => {
-    const { ui, handler } = await setupWithPendingNote();
-
-    expect(handler("0")).toEqual({ consume: true });
-    expect(lastWidgetArg(ui)).toBeUndefined();
-    expect(readProjectConfig().dismissedTopics ?? []).toHaveLength(0);
-  });
-
-  it("expanded '0' dismisses for the session and collapses", async () => {
-    const { ui, handler } = await setupWithPendingNote();
-    handler("1"); // expand
-
-    expect(handler("0")).toEqual({ consume: true });
-    expect(lastWidgetArg(ui)).toBeUndefined();
-    expect(readProjectConfig().dismissedTopics ?? []).toHaveLength(0);
-  });
-
-  it("passes keys through untouched when no note is pending", async () => {
-    const { ui } = await setup();
-    const handler = inputHandler(ui);
-    expect(handler("1")).toBeUndefined();
-    expect(handler("2")).toBeUndefined();
-    expect(handler("0")).toBeUndefined();
-  });
-
-  it("never consumes multi-character input (paste chunks), even with a pending note", async () => {
-    const { ui, handler } = await setupWithPendingNote();
-
-    expect(handler("12")).toBeUndefined();
-    expect(handler("1abc")).toBeUndefined();
-    expect(String(lastWidgetArg(ui))).toContain("Learn more"); // state untouched
-  });
-
-  it("expansion silently resets to collapsed when a newer note arrives", async () => {
-    const { ui, tools, handlers, ctx, handler } = await setupWithPendingNote({}, "First note topic", "info");
-    handler("1"); // expand the newest (first) note
-    expect(String(lastWidgetArg(ui))).toContain("Understood");
-
-    await addNoteViaTool(tools, "Second note topic");
-    handlers.get("tool_execution_end")![0](toolEndEvent("ysk-newer"), ctx);
-    const rendered = String(lastWidgetArg(ui));
-    expect(rendered).toContain("Learn more");
-    expect(rendered).not.toContain("Understood");
+    expect(ui.custom).not.toHaveBeenCalled(); // the late result never surfaces
   });
 });
 
 // --- answer-completion presentation (T4) --------------------------------------
 
 describe("you-should-know answer-completion presentation", () => {
-  it("defers widget writes while the agent loop runs and flushes notes at agent_end", async () => {
-    const { ui, registry, handlers, ctx } = await setup({ config: { reviewEvery: 1 } });
+  it("defers sidebar writes while the agent loop runs and flushes notes at agent_end", async () => {
+    const { ui, customCalls, registry, handlers, ctx } = await setup({ config: { reviewEvery: 1 } });
     handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
-    const callsWhenLoopStarted = widgetCalls(ui).length;
 
     handlers.get("tool_execution_end")![0](toolEndEvent("a"), ctx);
     await flush();
     expect(registry.calls()).toHaveLength(1); // reviewer still runs mid-loop
-    expect(widgetCalls(ui).length).toBe(callsWhenLoopStarted); // no widget write while active
-    expect(widgetText(ui)).not.toContain("Hidden decision");
+    expect(ui.custom).not.toHaveBeenCalled(); // presentation deferred
 
     handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
-    expect(widgetText(ui)).toContain("Hidden decision"); // presented at completion
+    expect(ui.custom).toHaveBeenCalledOnce(); // presented at completion
+    expect(renderOf(customCalls[0]!)).toContain("2 heads-up");
   });
 
   it("renders immediately when the agent loop is idle", async () => {
-    const { ui, tools, handlers, ctx } = await setup();
+    const { ui, customCalls, tools, handlers, ctx } = await setup();
     await addNoteViaTool(tools, "Idle note");
     handlers.get("tool_execution_end")![0](toolEndEvent("ysk-idle"), ctx);
-    expect(widgetText(ui)).toContain("Idle note");
+    expect(ui.custom).toHaveBeenCalledOnce();
+    expect(renderOf(customCalls[0]!)).toContain("1 head-up");
   });
 
-  it("agent_settled is the safety net: flushes pending renders without a second render at agent_end", async () => {
-    const { ui, tools, handlers, ctx } = await setup();
+  it("agent_settled is the safety net: refreshes the sidebar in place, idempotently", async () => {
+    const { ui, customCalls, tools, handlers, ctx } = await setup();
     await addNoteViaTool(tools, "Settled note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("ysk-1"), ctx);
+    expect(ui.custom).toHaveBeenCalledOnce();
+    expect(renderOf(customCalls[0]!)).toContain("1 head-up");
+
     handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
+    await addNoteViaTool(tools, "Second note");
     handlers.get("tool_execution_end")![0](toolEndEvent("ysk-settle"), ctx); // deferred: dirty
-    expect(widgetText(ui)).not.toContain("Settled note");
+    expect(ui.custom).toHaveBeenCalledTimes(1);
+    expect(renderOf(customCalls[0]!)).not.toContain("2 heads-up"); // snapshot not refreshed yet
 
     handlers.get("agent_settled")![0]({ type: "agent_settled", aborted: false }, ctx);
-    expect(widgetText(ui)).toContain("Settled note");
-    const callsAfterSettle = widgetCalls(ui).length;
+    expect(ui.custom).toHaveBeenCalledTimes(1); // refreshed in place, not reopened
+    expect(renderOf(customCalls[0]!)).toContain("2 heads-up");
+    const refreshes = customCalls[0]!.fakeTui.requestRender.mock.calls.length;
 
     handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
-    expect(widgetCalls(ui).length).toBe(callsAfterSettle); // flag cleared: idempotent
+    expect(ui.custom).toHaveBeenCalledTimes(1);
+    expect(customCalls[0]!.fakeTui.requestRender.mock.calls.length).toBe(refreshes); // flag cleared: idempotent
   });
 
-  it("defers dismissals mid-loop and flushes the cleared band at agent_end", async () => {
-    const { ui, handler, handlers, ctx } = await setupWithPendingNote();
-    expect(String(lastWidgetArg(ui))).toContain("Deployment gate is manual");
-    handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
-    const callsBeforeDismiss = widgetCalls(ui).length;
+  it("defers dismissals mid-loop and flushes the emptied sidebar at agent_end", async () => {
+    const { ui, customCalls, commands, tools, handlers, ctx } = await setup();
+    await addNoteViaTool(tools, "Only note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s1"), ctx);
+    expect(ui.custom).toHaveBeenCalledTimes(1);
 
-    expect(handler("0")).toEqual({ consume: true }); // session dismissal mid-loop
-    expect(widgetCalls(ui).length).toBe(callsBeforeDismiss); // write deferred
-    expect(widgetText(ui)).toContain("Deployment gate is manual"); // band still up
+    handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
+    await commands.get("ysk").handler("dismiss", ctx);
+    expect(ui.custom).toHaveBeenCalledTimes(1); // sidebar update deferred
+    expect(customCalls[0]!.resolve).not.toHaveBeenCalled(); // still open
 
     handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
-    expect(lastWidgetArg(ui)).toBeUndefined(); // flushed: empty band clears the widget
+    expect(customCalls[0]!.resolve).toHaveBeenCalledTimes(1); // flushed: empty tally closes the sidebar
   });
 });
 
@@ -761,19 +590,17 @@ describe("you-should-know tally sidebar overlay", () => {
     handlers.get("tool_execution_end")![0](toolEndEvent("s2"), ctx);
     expect(ui.custom).toHaveBeenCalledOnce(); // no second overlay instance
     expect(open.fakeTui.requestRender).toHaveBeenCalledOnce(); // refreshed, not reopened
-    expect((open.component.render?.(100) as string[]).join("\n")).toContain("2 heads-up");
+    expect(renderOf(open)).toContain("2 heads-up");
   });
 
   it("closes the sidebar via its done when the last note is dismissed and opens a fresh overlay for a later note", async () => {
-    const { ui, customCalls, tools, handlers, ctx, handler } = await setupWithPendingNote(
-      {},
-      "Only note",
-      "info",
-    );
+    const { ctx, ui, commands, customCalls, tools, handlers } = await setup();
+    await addNoteViaTool(tools, "Only note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s1"), ctx);
     expect(customCalls).toHaveLength(1);
     const first = customCalls[0]!;
 
-    expect(handler("0")).toEqual({ consume: true }); // dismiss for the session
+    await commands.get("ysk").handler("dismiss", ctx);
     expect(first.resolve).toHaveBeenCalledTimes(1); // done captured, invoked quiet
     expect(first.resolve).toHaveBeenCalledWith(undefined);
 
@@ -829,7 +656,165 @@ describe("you-should-know tally sidebar overlay", () => {
     // pi may still hold the overlay for a frame after disposal: a stale
     // generation must never repaint session state.
     expect(open.component.render?.(100)).toEqual([]);
-    // The click-routing surface exists (T3) but stays inert until then.
+    // The sidebar click-routing surface stays inert (the popup is the only
+    // interactive overlay in T3's scope).
     expect(open.component.handleMouse?.({ type: "down" })).toBeUndefined();
+  });
+});
+
+// --- note popup (T3) -----------------------------------------------------------
+
+describe("you-should-know note popup", () => {
+  it("bare /ysk opens a centered capturing popup: list rows for 2+ pending, detail rows for exactly 1", async () => {
+    const { ui, popup } = await setupWithPopup(["Silent assumption", "Hidden decision"], ["warning", "critical"]);
+    expect(ui.custom).toHaveBeenCalledTimes(2); // sidebar + popup
+    expect(popup.opts?.overlay).toBe(true);
+    expect(popup.opts?.overlayOptions).toEqual({ anchor: "center", width: "60%", maxHeight: "60%", margin: 1 });
+    expect(popup.component.render?.(100)).toEqual([
+      "<muted>Heads up",
+      "<warning>1. [warning] Silent assumption",
+      "<error>2. [critical] Hidden decision",
+      "<muted>number to open · Esc to close",
+    ]);
+
+    const single = await setupWithPopup(["Only note"]);
+    expect(single.popup.component.render?.(100)).toEqual([
+      "<accent>Heads up · Only note",
+      "<accent>",
+      "<accent>Only note",
+      "<accent>",
+      "<muted>1: Understood",
+      "<muted>2: Chat in main session",
+      "<muted>0: Dismiss",
+    ]);
+  });
+
+  it("list stage: pressing a note number switches to that note's detail rows", async () => {
+    const { popup } = await setupWithPopup(["First note", "Second note"]);
+    popup.component.handleInput!("1");
+    const rows = popup.component.render?.(100) ?? [];
+    expect(rows.join("\n")).toContain("Heads up · First note");
+    expect(rows.join("\n")).not.toContain("number to open");
+  });
+
+  it("detail stage: '1' (Understood) marks processed, closes the popup, and refreshes the sidebar", async () => {
+    const { ctx, ui, popup, sidebar } = await setupWithPopup(
+      ["Silent assumption", "Hidden decision"],
+      ["warning", "critical"],
+    );
+    popup.component.handleInput!("1"); // open note 1
+    popup.component.handleInput!("1"); // Understood
+    expect(popup.resolve).toHaveBeenCalledTimes(1); // popup closed
+    expect(sidebar.resolve).not.toHaveBeenCalled(); // one note still pending
+    expect(ui.setEditorText).not.toHaveBeenCalled(); // non-destructive: no editor fill
+    expect(sidebar.fakeTui.requestRender).toHaveBeenCalled(); // sidebar refreshed in place
+    expect(renderOf(sidebar)).toContain("1 head-up");
+    void ctx;
+  });
+
+  it("detail stage: '2' (Chat) fills the editor, marks processed, and closes", async () => {
+    const { popup, sidebar, ui } = await setupWithPopup(["Only note\ndetail body"], ["warning"]);
+    popup.component.handleInput!("2");
+    expect(ui.setEditorText).toHaveBeenCalledOnce();
+    const text = ui.setEditorText.mock.calls[0]![0] as string;
+    expect(text).toContain("Re: heads-up — please address");
+    expect(text).toContain("Only note");
+    expect(text).toContain("detail body");
+    expect(popup.resolve).toHaveBeenCalledTimes(1);
+    expect(sidebar.resolve).toHaveBeenCalledTimes(1); // last note processed -> sidebar closes
+    expect(sidebar.fakeTui.requestRender).toHaveBeenCalled(); // editor repaint through the captured TUI
+  });
+
+  it("detail stage: '0' (Dismiss) hides the note for the session and closes the popup", async () => {
+    const { popup, sidebar } = await setupWithPopup(["Noisy note"]);
+    popup.component.handleInput!("0");
+    expect(popup.resolve).toHaveBeenCalledTimes(1);
+    expect(sidebar.resolve).toHaveBeenCalledTimes(1);
+    expect(readProjectConfig().dismissedTopics ?? []).toHaveLength(0); // session-scoped, not persisted
+  });
+
+  it("Esc closes the popup without processing (kitty CSI-u and legacy forms)", async () => {
+    const first = await setupWithPopup(["Pending note"]);
+    first.popup.component.handleInput!("\x1b[27u"); // kitty CSI-u escape
+    expect(first.popup.resolve).toHaveBeenCalledTimes(1);
+    expect(first.sidebar.resolve).not.toHaveBeenCalled();
+    expect(renderOf(first.sidebar)).toContain("1 head-up"); // note still pending
+
+    // Legacy bare-ESC byte sequence: same behavior on a freshly opened popup.
+    await first.commands.get("ysk").handler("", first.ctx);
+    const reopened = first.customCalls.at(-1)!;
+    reopened.component.handleInput!("\x1b");
+    expect(reopened.resolve).toHaveBeenCalledTimes(1);
+    expect(first.sidebar.resolve).not.toHaveBeenCalled();
+    expect(renderOf(first.sidebar)).toContain("1 head-up");
+  });
+
+  it("handleMouse picks a list row and fires the trailing detail action rows", async () => {
+    const { popup, ui } = await setupWithPopup(["Silent assumption", "Hidden decision"], ["warning", "critical"]);
+    popup.component.handleMouse!(clickEvent(1)); // "1. [warning] Silent assumption"
+    expect(renderOf(popup)).toContain("Heads up · Silent assumption"); // switched to detail
+
+    // Detail rows: header(0), blank(1), detail(2), blank(3), then the 3-row hint block.
+    popup.component.handleMouse!(clickEvent(5)); // "2: Chat in main session"
+    expect(ui.setEditorText).toHaveBeenCalledOnce();
+    expect(popup.resolve).toHaveBeenCalledTimes(1); // chat closes the popup
+  });
+
+  it("a detail text row that literally starts '2: Chat' is never an action", async () => {
+    const { popup, ui } = await setupWithPopup(["2: Chat would be a mistake here"]);
+    const rows = popup.component.render?.(100) ?? [];
+    const trickyAt = rows.findIndex((row, index) => index > 0 && row.includes("2: Chat would be a mistake"));
+    expect(trickyAt).toBeGreaterThan(0);
+    expect(trickyAt).toBeLessThan(rows.length - 3); // outside the trailing hint block
+
+    popup.component.handleMouse!(clickEvent(trickyAt));
+    expect(ui.setEditorText).not.toHaveBeenCalled(); // no action fired
+    expect(popup.resolve).not.toHaveBeenCalled(); // popup stays open
+  });
+
+  it("processing notes shrinks the sidebar tally and closes it when the last one is processed", async () => {
+    const { ctx, commands, sidebar, customCalls } = await setupWithPopup(
+      ["Silent assumption", "Hidden decision"],
+      ["warning", "critical"],
+    );
+    customCalls[1]!.component.handleInput!("1"); // detail: note 1
+    customCalls[1]!.component.handleInput!("1"); // Understood
+    expect(renderOf(sidebar)).toContain("1 head-up");
+    expect(sidebar.resolve).not.toHaveBeenCalled();
+
+    await commands.get("ysk").handler("", ctx); // reopen for the remaining note -> detail
+    customCalls[2]!.component.handleInput!("1"); // Understood
+    expect(sidebar.resolve).toHaveBeenCalledTimes(1); // empty tally -> sidebar done invoked
+  });
+
+  it("opening a popup closes the previous one first: exactly one popup at a time", async () => {
+    const { ctx, commands, customCalls } = await setupWithPopup(["Only note"]);
+    await commands.get("ysk").handler("", ctx);
+    expect(customCalls[1]!.resolve).toHaveBeenCalledTimes(1); // first popup closed
+    expect(customCalls[2]).toBeDefined(); // replacement popup is open
+  });
+
+  it("session_shutdown closes an open popup alongside the sidebar", async () => {
+    const { ctx, handlers, popup, sidebar } = await setupWithPopup(["Only note"]);
+    handlers.get("session_shutdown")![0]({ type: "session_shutdown", reason: "quit" }, ctx);
+    expect(popup.resolve).toHaveBeenCalledTimes(1);
+    expect(sidebar.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("headless mode: /ysk never opens a popup", async () => {
+    const { ctx, ui, commands, tools, handlers } = await setup({ hasUI: false });
+    await addNoteViaTool(tools, "Headless note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("headless"), ctx);
+    await commands.get("ysk").handler("", ctx);
+    await commands.get("ysk").handler("learn 1", ctx);
+    expect(ui.custom).not.toHaveBeenCalled();
+  });
+
+  it("/ysk status stays textual: no popup, no overlay change", async () => {
+    const { ctx, ui, commands } = await setupWithPopup(["Only note"]);
+    const opensBefore = ui.custom.mock.calls.length;
+    await commands.get("ysk").handler("status", ctx);
+    expect(ui.custom.mock.calls).toHaveLength(opensBefore);
+    expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("pending notes: 1"), "info");
   });
 });

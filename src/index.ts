@@ -4,16 +4,18 @@
  * A quiet background reviewer: every `reviewEvery` completed tool steps it
  * sends a bounded transcript digest to a nested model call
  * (ctx.modelRegistry.streamSimple) and surfaces findings as non-blocking
- * HUD notes above the prompt. Notes become visible only when the chat answer
- * completes: while the agent loop is active (agent_start..agent_end) every
- * widget write is deferred behind a dirty flag and flushed on agent_end /
- * agent_settled, so mid-task tool rounds never leak notes. Core logic (step
- * counting, reviewing, the note store) runs in every mode; only widget,
- * editor-fill, terminal-input, and notification touches are guarded behind
- * ctx.hasUI / ctx.mode === "tui".
+ * notes through two overlays: a right-edge tally sidebar (always mirroring
+ * the pending store) and a centered popup (note list/detail with 1/2/0
+ * actions). Notes become visible only when the chat answer completes: while
+ * the agent loop is active (agent_start..agent_end) every sidebar write is
+ * deferred behind a dirty flag and flushed on agent_end / agent_settled, so
+ * mid-task tool rounds never leak notes. Core logic (step counting,
+ * reviewing, the note store) runs in every mode; only sidebar, popup,
+ * editor-fill, and notification touches are guarded behind ctx.hasUI /
+ * ctx.mode === "tui".
  *
- * Failure policy: quiet by design. A broken reviewer, a missing model, or a
- * widget hiccup must never throw into the runtime; /ysk status is the
+ * Failure policy: quiet by design. A broken reviewer, a missing model, or an
+ * overlay hiccup must never throw into the runtime; /ysk status is the
  * user-visible window into reviewer state.
  */
 
@@ -28,19 +30,31 @@ import type {
   SessionShutdownEvent,
   ToolExecutionEndEvent,
 } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { DEFAULT_REVIEW_EVERY, loadConfig, saveDismissed, type YskConfig } from "./config.ts";
 import { wireActions } from "./actions.ts";
 import { formatNotesForChat, NoteStore, type Note } from "./notes.ts";
 import { buildDigest, runReviewer, type ReviewerRequest } from "./reviewer.ts";
 import { StepCounter } from "./steps.ts";
 import { registerHeadsUpTool } from "./tool.ts";
-import { KEY_ACTIONS, severityColorToken, sidebarRows, widgetLines, type WidgetLine } from "./widget.ts";
+import {
+  POPUP_ACTIONS,
+  popupActionAtRow,
+  popupDetailRows,
+  popupListRows,
+  noteIndexAtPopupRow,
+  severityColorToken,
+  sidebarRows,
+  type WidgetLine,
+} from "./widget.ts";
 
-const WIDGET_ID = "ysk";
 const USER_CONFIG_PATH = "~/.pi/agent/you-should-know.json";
-const DEFAULT_WIDGET_WIDTH = 100;
 /** Column width of the tally sidebar overlay; rows are truncated to this. */
 const SIDEBAR_WIDTH = 26;
+/** Popup rows truncate to the overlay's 60% width, never below this. */
+const POPUP_WIDTH_MIN = 40;
+/** Popup overlay width as a fraction of the terminal width. */
+const POPUP_WIDTH_RATIO = 0.6;
 
 /**
  * The streamSimple adapter surface, derived structurally from the installed
@@ -51,9 +65,8 @@ type ReviewerModel = Parameters<StreamSimpleFn>[0];
 type SimpleStreamOptions = Parameters<StreamSimpleFn>[2];
 
 /**
- * The subset of pi's OverlayHandle the sidebar keeps. Structurally derived
- * so tests can pass minimal fakes and this file never imports pi-tui
- * directly; T3 click routing consumes the bounds/focus surface.
+ * The subset of pi's OverlayHandle the overlays keep. Structurally derived so
+ * tests can pass minimal fakes; only matchesKey is imported from pi-tui.
  */
 interface OverlayHandleLike {
   hide(): void;
@@ -62,6 +75,12 @@ interface OverlayHandleLike {
   unfocus(): void;
   getBounds(): { row: number; col: number; width: number; height: number } | undefined;
 }
+
+/** What a popup shows: every pending note (list stage) or one note (detail). */
+type PopupTarget = Note | { all: true };
+
+/** Popup component state: the list stage or the detail stage. */
+type PopupStage = { kind: "list"; notes: Note[] } | { kind: "detail"; note: Note };
 
 /** Default export: the extension factory (sync; no heavy work, no I/O). */
 export default function youShouldKnowExtension(pi: ExtensionAPI): void {
@@ -78,45 +97,38 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   let generation = 0;
   let inFlight = false;
   let currentController: AbortController | null = null;
-  // Answer-completion presentation: while an agent loop is running, widget
+  // Answer-completion presentation: while an agent loop is running, sidebar
   // writes are deferred (renderDirty) and flushed at the loop boundary, so
   // notes only surface when the chat answer completes. Session-scoped; reset
   // on session_start/session_shutdown.
   let agentActive = false;
   let renderDirty = false;
-  // Key-layer state: which pending note is expanded (its topic), plus the
-  // terminal-input unsubscribe handle for the current session.
-  let expandedTopic: string | null = null;
-  let unsubscribeInput: (() => void) | null = null;
-  // Live TUI captured from the widget factory (last factory invocation wins).
-  // pi hands the factory the interactive TUI when it registers the widget, so
-  // after setEditorText mutates editor state we can request the repaint that
-  // setEditorText itself never schedules. Stays valid for the session even if
-  // the widget is later cleared; null in headless/RPC contexts, where the
-  // factory never runs.
-  let widgetTui: { requestRender: (force?: boolean) => void } | null = null;
   // Tally sidebar overlay state (session-scoped). sidebarDone is pi's own
   // done callback captured inside the custom() factory: resolving it closes
   // and disposes the overlay, so the empty-snapshot path closes through pi
-  // instead of tearing UI down by hand. sidebarHandle is the overlay handle
-  // for T3 click routing; sessionTui is the live TUI captured by the sidebar
-  // factory (preferred repaint target for editor fills); sidebarSnapshot is
-  // the immutable row list every overlay frame renders from.
+  // instead of tearing UI down by hand. sidebarHandle is the overlay handle;
+  // sessionTui is the live TUI captured by the overlay factories (preferred
+  // repaint target for editor fills); sidebarSnapshot is the immutable row
+  // list every sidebar frame renders from.
   let sidebarDone: ((value: unknown) => void) | null = null;
   let sidebarHandle: OverlayHandleLike | null = null;
   let sessionTui: { requestRender: (force?: boolean) => void } | null = null;
   let sidebarSnapshot: WidgetLine[] = [];
+  // Note popup overlay state (session-scoped, same done-capture pattern).
+  // One popup at a time: opening a new one closes the previous first.
+  let popupDone: ((value: unknown) => void) | null = null;
+  let popupHandle: OverlayHandleLike | null = null;
 
   // Persistence of permanent dismissals flows through the /ysk ActionDeps
   // (`persist` below), the single write path; no store-level callback.
   const store = new NoteStore();
 
-  // --- widget --------------------------------------------------------------
+  // --- gated overlay rendering ---------------------------------------------
 
   /**
    * Dirty-aware render entry point. While the agent loop is active every
    * render request (reviewer note arrival, heads_up additions, dismissals,
-   * /ysk actions) only marks the widget dirty; the loop-boundary handlers
+   * /ysk actions) only marks the sidebar dirty; the loop-boundary handlers
    * flush it. When idle, renders behave exactly as before: immediate write.
    */
   function requestRender(ctx: ExtensionContext | null): void {
@@ -124,52 +136,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       renderDirty = true;
       return;
     }
-    writeWidget(ctx);
     writeSidebar(ctx);
-  }
-
-  /** The actual widget writer; safe to call repeatedly (idempotent output). */
-  function writeWidget(ctx: ExtensionContext | null): void {
-    if (!ctx) return;
-    try {
-      if (!ctx.hasUI) return;
-      const pending = store.pending;
-      const newest = pending.length > 0 ? pending[pending.length - 1] : undefined;
-      // Expansion is only valid while the newest pending note is still the
-      // expanded one: a newer note arriving or the target disappearing
-      // silently resets to the collapsed band.
-      if (expandedTopic !== null && newest?.topic !== expandedTopic) expandedTopic = null;
-      const expanded = newest !== undefined && newest.topic === expandedTopic;
-      if (newest === undefined) {
-        // Empty band: clear the widget exactly as before (no factory to invoke).
-        ctx.ui.setWidget(WIDGET_ID, undefined, { placement: "aboveEditor" });
-        return;
-      }
-      // Factory overload: the widget rows are snapshotted per write so frames
-      // redrawn between writes (agent-loop deferral windows) can never leak
-      // newer store state, while theming happens per render inside the
-      // component so theme changes stay correct. pi invokes the factory with
-      // the live TUI, captured above for editor repaints.
-      const rows = widgetLines(pending, { width: DEFAULT_WIDGET_WIDTH, expanded });
-      ctx.ui.setWidget(
-        WIDGET_ID,
-        (tui, theme) => {
-          widgetTui = tui; // plain assignment: capture even if the rest fails
-          try {
-            return {
-              render: () => rows.map((row) => theme.fg(severityColorToken(row.severity), row.text)),
-              invalidate: () => {},
-            };
-          } catch {
-            // quiet: a broken widget factory must never crash the session
-            return { render: () => [], invalidate: () => {} };
-          }
-        },
-        { placement: "aboveEditor" },
-      );
-    } catch {
-      // widget failures must never crash the session
-    }
   }
 
   // --- tally sidebar overlay ------------------------------------------------
@@ -177,11 +144,10 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   /**
    * Sidebar writer: snapshot the pending-note tally, then open, refresh, or
    * close the right-edge overlay so it always mirrors the store. Lives on the
-   * same gated render path as the band (idle requestRender + loop-boundary
-   * flush), so mid-loop arrivals stay deferred behind the dirty flag. The
-   * snapshot is taken before any UI touch and every overlay frame renders
-   * from it, so a frame redraw can never leak newer store state (same
-   * invariant as the band).
+   * same gated render path as the popup opens (idle requestRender +
+   * loop-boundary flush), so mid-loop arrivals stay deferred behind the dirty
+   * flag. The snapshot is taken before any UI touch and every sidebar frame
+   * renders from it, so a frame redraw can never leak newer store state.
    */
   function writeSidebar(ctx: ExtensionContext | null): void {
     if (!ctx) return;
@@ -237,7 +203,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
           },
           invalidate: () => {},
           handleMouse: (event) => {
-            void event; // click routing arrives in T3; keep the hook so the surface exists
+            void event; // the sidebar stays inert: the popup owns interaction
             return undefined;
           },
         };
@@ -281,6 +247,155 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     }
   }
 
+  // --- note popup overlay ---------------------------------------------------
+
+  /**
+   * Close any open popup via its captured done and clear the popup state.
+   * The done-capture pattern is the single close path: pi disposes the
+   * overlay when the custom() promise resolves, so nothing is torn down by
+   * hand. Safe to call when nothing is open.
+   */
+  function closePopup(): void {
+    const finish = popupDone;
+    popupDone = null;
+    popupHandle = null;
+    if (!finish) return;
+    try {
+      finish(undefined);
+    } catch {
+      // quiet: popup disposal is best-effort
+    }
+  }
+
+  /** Row width for popup renders: the overlay's 60% width, never below 40. */
+  function popupRowWidth(viewportWidth: number | undefined): number {
+    const usable =
+      typeof viewportWidth === "number" && Number.isFinite(viewportWidth)
+        ? Math.floor(viewportWidth * POPUP_WIDTH_RATIO)
+        : POPUP_WIDTH_MIN;
+    return Math.max(POPUP_WIDTH_MIN, usable);
+  }
+
+  /**
+   * Open the note popup as a capturing centered overlay. TUI-only: headless
+   * and RPC contexts never open anything. One popup at a time — an open
+   * popup is closed through its captured done first. Stage selection: more
+   * than one target note shows the list stage, exactly one shows the detail
+   * stage directly. The notes are snapshotted up front (never re-read from
+   * the live store while the popup is open), and every frame renders from
+   * that snapshot.
+   */
+  function openPopup(target: PopupTarget): void {
+    const ctx = ctxRef;
+    if (!ctx || !ctx.hasUI || ctx.mode !== "tui") return;
+    closePopup(); // exactly one popup at a time
+
+    const notes = (target as { all?: true }).all === true ? store.pending : [target as Note];
+    if (notes.length === 0) return;
+    let stage: PopupStage =
+      notes.length > 1 ? { kind: "list", notes } : { kind: "detail", note: notes[0]! };
+    let popupRows: WidgetLine[] = []; // rows of the most recent frame, for mouse hit-testing
+
+    /** Rows of the current stage at the given width (render's single source). */
+    const currentRows = (width: number | undefined): WidgetLine[] =>
+      stage.kind === "list"
+        ? popupListRows(stage.notes, { width: popupRowWidth(width) })
+        : popupDetailRows(stage.note, { width: popupRowWidth(width) });
+
+    const gen = generation;
+    void ctx.ui.custom(
+      (tui, theme, _keybindings, done) => {
+        sessionTui = tui; // plain assignment FIRST: capture even if the rest fails
+        popupDone = done; // pi's own resolve: the close path hands it back
+        return {
+          render: (width?: number) => {
+            if (gen !== generation) return []; // stale generation renders nothing
+            // Frames redraw constantly: recompute rows from the snapshot stage.
+            popupRows = currentRows(width);
+            return popupRows.map((row) => theme.fg(severityColorToken(row.severity), row.text));
+          },
+          handleInput: (data: string) => {
+            if (gen !== generation) return;
+            if (matchesKey(data, "escape")) {
+              closePopup(); // Esc: close without processing anything
+              return;
+            }
+            if (stage.kind === "list") {
+              // Digits 1..9 pick the row they name (noteIndexAtPopupRow semantics).
+              if (!/^[1-9]$/.test(data)) return;
+              const picked = stage.notes[Number(data) - 1];
+              if (!picked) return;
+              stage = { kind: "detail", note: picked };
+              sessionTui?.requestRender();
+              return;
+            }
+            const action = POPUP_ACTIONS.find((entry) => entry.key === data)?.action;
+            if (!action) return;
+            const note = stage.note;
+            if (action === "understood") {
+              store.dismissSession(note.topic);
+              requestRender(ctxRef); // refresh (or close) the sidebar tally
+              closePopup();
+            } else if (action === "chat") {
+              fillEditor(composedNoteText(note)); // prompt fill only: never sends
+              markProcessed(note);
+              closePopup();
+            } else {
+              store.dismissSession(note.topic);
+              requestRender(ctxRef);
+              closePopup();
+            }
+          },
+          handleMouse: (event) => {
+            if (gen !== generation) return undefined;
+            if (event?.type !== "click" || event.button !== "left") return undefined;
+            // Hit-test against the rows pi actually rendered; if no frame has
+            // been drawn yet, derive them from the event's own width.
+            if (popupRows.length === 0) popupRows = currentRows(event?.width);
+            if (stage.kind === "list") {
+              const index = noteIndexAtPopupRow(popupRows, event.y);
+              const picked = index === null ? undefined : stage.notes[index - 1];
+              if (!picked) return undefined;
+              stage = { kind: "detail", note: picked };
+              sessionTui?.requestRender();
+              return { handled: true };
+            }
+            // popupActionAtRow's positional guard keeps the hit on the
+            // trailing hint block only; detail text can never fire an action.
+            const action = popupActionAtRow(popupRows, event.y);
+            if (action === null) return undefined;
+            const note = stage.note;
+            if (action === "understood" || action === "dismiss") {
+              store.dismissSession(note.topic);
+              requestRender(ctxRef);
+            } else {
+              fillEditor(composedNoteText(note));
+              markProcessed(note);
+            }
+            closePopup();
+            return { handled: true };
+          },
+          invalidate: () => {},
+        };
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          anchor: "center",
+          width: "60%",
+          maxHeight: "60%",
+          margin: 1,
+        },
+        onHandle: (handle) => {
+          if (gen !== generation) return; // stale generation must not capture the handle
+          popupHandle = handle;
+        },
+      },
+    ).catch(() => {
+      // quiet: a failed popup open must never crash the session
+    });
+  }
+
   // --- session lifecycle ---------------------------------------------------
 
   pi.on("session_start", (_event: SessionStartEvent, ctx: ExtensionContext) => initSession(ctx));
@@ -292,7 +407,8 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     currentController = null;
     agentActive = false;
     renderDirty = false;
-    resetSidebar(); // close the replaced session's overlay; the new one reopens on demand
+    resetSidebar(); // close the replaced session's overlays; the new one reopens on demand
+    closePopup();
     counter = new StepCounter();
     try {
       const cwd = typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
@@ -309,8 +425,6 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     for (const topic of sessionConfig.dismissedTopics) {
       if (!store.isDismissed(topic)) store.dismissPermanently(topic);
     }
-    expandedTopic = null; // a fresh session starts with the collapsed band
-    subscribeTerminalInput(ctx);
     requestRender(ctx);
   }
 
@@ -326,7 +440,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     agentActive = false;
     renderDirty = false;
     resetSidebar();
-    unsubscribeTerminalInput();
+    closePopup();
     ctxRef = null;
   });
 
@@ -343,91 +457,17 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
 
   pi.on("agent_settled", (_event: AgentSettledEvent, ctx: ExtensionContext) => {
     // Safety net: also fires for aborted/errored loops that never reach a
-    // clean agent_end, so the dirty flag can never wedge the widget. The
+    // clean agent_end, so the dirty flag can never wedge the sidebar. The
     // flag clears before writing, keeping the agent_end pair idempotent.
     agentActive = false;
     flushDirtyRender(ctx);
   });
 
-  /** Flush one deferred widget write: clear the dirty flag first, then write. */
+  /** Flush one deferred sidebar write: clear the dirty flag first, then write. */
   function flushDirtyRender(ctx: ExtensionContext): void {
     if (!renderDirty) return;
     renderDirty = false;
-    writeWidget(ctx);
     writeSidebar(ctx);
-  }
-
-  // --- terminal-input key layer (TUI-only) ----------------------------------
-
-  /** Detach the current session's terminal-input handler, if any. */
-  function unsubscribeTerminalInput(): void {
-    const unsubscribe = unsubscribeInput;
-    unsubscribeInput = null;
-    if (!unsubscribe) return;
-    try {
-      unsubscribe();
-    } catch {
-      // quiet: a stale unsubscribe must never crash the session
-    }
-  }
-
-  /**
-   * Subscribe the number-key handler for one session. TUI-only: headless and
-   * RPC contexts never subscribe, so the keys stay untouched. Called on every
-   * session_start after the previous session's handler was detached.
-   */
-  function subscribeTerminalInput(ctx: ExtensionContext): void {
-    unsubscribeTerminalInput();
-    if (!ctx.hasUI || ctx.mode !== "tui") return;
-    try {
-      unsubscribeInput = ctx.ui.onTerminalInput(handleTerminalInput) ?? null;
-    } catch {
-      unsubscribeInput = null; // quiet: input interception is best-effort
-    }
-  }
-
-  /**
-   * Number-key actions on the NEWEST pending note while the band is shown.
-   * Collapsed: 1 expands, 2 dismisses permanently, 0 dismisses for the
-   * session. Expanded: 1 acknowledges (collapse, note stays pending), 2
-   * fills the editor with the composed explanation, 0 dismisses + collapses.
-   * Everything else — multi-character chunks, pastes, unknown keys, no
-   * pending notes, non-TUI contexts — returns undefined so the key reaches
-   * the editor untouched. Key labels come from KEY_ACTIONS, never literals.
-   */
-  function handleTerminalInput(data: string): { consume: boolean } | undefined {
-    const ctx = ctxRef;
-    if (!ctx || !ctx.hasUI || ctx.mode !== "tui") return undefined;
-    if (typeof data !== "string" || data.length !== 1) return undefined; // paste/multi-byte chunk
-    const pending = store.pending;
-    const newest = pending.length > 0 ? pending[pending.length - 1] : undefined;
-    if (!newest) return undefined; // nothing shown: keys are the editor's
-    const expanded = expandedTopic !== null && newest.topic === expandedTopic;
-
-    if (data === (expanded ? KEY_ACTIONS.expanded.dismiss : KEY_ACTIONS.collapsed.dismiss)) {
-      expandedTopic = null;
-      store.dismissSession(newest.topic);
-      requestRender(ctx);
-      return { consume: true };
-    }
-    if (data === (expanded ? KEY_ACTIONS.expanded.understood : KEY_ACTIONS.collapsed.learn)) {
-      // Expand acts on the newest note; "understood" collapses without
-      // dismissing (non-destructive acknowledgment).
-      expandedTopic = expanded ? null : newest.topic;
-      requestRender(ctx);
-      return { consume: true };
-    }
-    if (data === (expanded ? KEY_ACTIONS.expanded.chat : KEY_ACTIONS.collapsed.known)) {
-      if (expanded) {
-        fillEditor(composedNoteText(newest)); // prompt fill only: never sends, never dismisses
-      } else {
-        store.dismissPermanently(newest.topic);
-        void persistDismissed(store.dismissedTopics);
-        requestRender(ctx);
-      }
-      return { consume: true };
-    }
-    return undefined;
   }
 
   // --- review cadence ------------------------------------------------------
@@ -436,7 +476,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     try {
       if (!event || typeof event !== "object") return;
       counter.recordStep();
-      requestRender(ctx); // keeps the HUD fresh after heads_up and store changes
+      requestRender(ctx); // keeps the overlays fresh after heads_up and store changes
       maybeStartReview(ctx);
     } catch {
       // never throw into the runtime
@@ -537,8 +577,9 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   }
 
   /**
-   * Composed chat framing for one note, shared by the expanded '2' key and
-   * /ysk chat: the text lands in the editor for manual review and sending.
+   * Composed chat framing for one note, shared by the popup '2' (Chat)
+   * action and /ysk chat: the text lands in the editor for manual review and
+   * sending.
    */
   function composedNoteText(note: Note): string {
     return `Re: heads-up — please address\n\n${formatNotesForChat([note])}`;
@@ -554,30 +595,24 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     try {
       ctx.ui.setEditorText(text);
       // setEditorText only mutates editor state; ask the TUI captured by the
-      // sidebar (preferred) or band factory for the repaint so the note is
-      // visible immediately. Upstream gap tracked in earendil-works/pi#5620
-      // (setEditorText does not re-render outside the input loop); if that
-      // fix lands, the requestRender here becomes redundant but harmless.
-      (sessionTui ?? widgetTui)?.requestRender();
+      // overlay factories for the repaint so the text is visible immediately.
+      // Upstream gap tracked in earendil-works/pi#5620 (setEditorText does
+      // not re-render outside the input loop); if that fix lands, the
+      // requestRender here becomes redundant but harmless.
+      sessionTui?.requestRender();
     } catch {
       // editor fill is best-effort and must never crash the session
     }
   }
 
   /**
-   * /ysk learn adapter: expand the widget band to this note's full detail,
-   * in place, sharing the key layer's expansion state. Only the newest
-   * pending note can be expanded (the band renders one note); anything
-   * else is a quiet no-op. Headless contexts never render, so this also
-   * refuses to touch the state there.
+   * Mark one note processed for this session: it leaves the pending tally
+   * (dismissSession), and the sidebar refreshes on the next gated render.
+   * Not permanent — /ysk known remains the permanent-dismissal path.
    */
-  function expandNote(note: Note): void {
-    const ctx = ctxRef;
-    if (!ctx || !ctx.hasUI) return;
-    const newest = store.pending.length > 0 ? store.pending[store.pending.length - 1] : undefined;
-    if (!newest || newest.topic !== note.topic) return;
-    expandedTopic = newest.topic;
-    requestRender(ctx);
+  function markProcessed(note: Note): void {
+    store.dismissSession(note.topic);
+    requestRender(ctxRef);
   }
 
   function persistDismissed(topics: string[]): Promise<void> {
@@ -604,7 +639,8 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
 
   wireActions(pi, {
     store,
-    expandNote,
+    openPopup,
+    markProcessed,
     fillEditor,
     persist: () => persistDismissed(store.dismissedTopics),
     rerender: () => requestRender(ctxRef),

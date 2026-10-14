@@ -7,9 +7,9 @@ function note(topic: string, title = `Title: ${topic}`): Note {
 }
 
 describe("parseYskArgs", () => {
-  it("defaults to status for empty input", () => {
-    expect(parseYskArgs("")).toEqual({ action: "status" });
-    expect(parseYskArgs("   ")).toEqual({ action: "status" });
+  it("opens the popup for empty input", () => {
+    expect(parseYskArgs("")).toEqual({ action: "popup" });
+    expect(parseYskArgs("   ")).toEqual({ action: "popup" });
   });
 
   it("parses each known action", () => {
@@ -18,6 +18,7 @@ describe("parseYskArgs", () => {
     expect(parseYskArgs("chat")).toEqual({ action: "chat" });
     expect(parseYskArgs("dismiss")).toEqual({ action: "dismiss" });
     expect(parseYskArgs("status")).toEqual({ action: "status" });
+    expect(parseYskArgs("popup")).toEqual({ action: "popup" });
   });
 
   it("is tolerant of surrounding whitespace and case-insensitive... no, keeps exact tokens", () => {
@@ -28,6 +29,7 @@ describe("parseYskArgs", () => {
   it("parses a 1-based index after the action", () => {
     expect(parseYskArgs("dismiss 2")).toEqual({ action: "dismiss", index: 2 });
     expect(parseYskArgs("learn 1")).toEqual({ action: "learn", index: 1 });
+    expect(parseYskArgs("popup 2")).toEqual({ action: "popup", index: 2 });
   });
 
   it("treats a bare index as shorthand for learning that note", () => {
@@ -57,7 +59,7 @@ describe("resolveNote", () => {
     expect(resolveNote(pending)?.topic).toBe("newest");
   });
 
-  it("resolves 1-based indexes oldest-first, matching widget order", () => {
+  it("resolves 1-based indexes oldest-first, matching popup list order", () => {
     expect(resolveNote(pending, 1)?.topic).toBe("oldest");
     expect(resolveNote(pending, 3)?.topic).toBe("newest");
   });
@@ -87,7 +89,8 @@ describe("wireActions", () => {
     store.replacePending(pendingNotes);
     const deps: ActionDeps = {
       store,
-      expandNote: vi.fn(),
+      openPopup: vi.fn(),
+      markProcessed: vi.fn(),
       fillEditor: vi.fn(),
       persist: vi.fn(),
       rerender: vi.fn(),
@@ -99,6 +102,10 @@ describe("wireActions", () => {
     return { deps, handler };
   }
 
+  function openPopupCalls(deps: ActionDeps): unknown[] {
+    return (deps.openPopup as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[0]);
+  }
+
   it("registers the /ysk command with argument completions", () => {
     const commands = new Map<string, { handler: Handler; getArgumentCompletions?: (p: string) => unknown }>();
     const pi = { registerCommand: (name: string, options: never) => commands.set(name, options) };
@@ -106,7 +113,8 @@ describe("wireActions", () => {
       pi as never,
       {
         store: new NoteStore(),
-        expandNote: vi.fn(),
+        openPopup: vi.fn(),
+        markProcessed: vi.fn(),
         fillEditor: vi.fn(),
         persist: vi.fn(),
         rerender: vi.fn(),
@@ -117,25 +125,46 @@ describe("wireActions", () => {
     expect(commands.get("ysk")!.handler).toBeTypeOf("function");
     const completions = commands.get("ysk")!.getArgumentCompletions?.("");
     expect(completions).toContainEqual(expect.objectContaining({ value: "learn" }));
+    expect(completions).toContainEqual(expect.objectContaining({ value: "popup" }));
   });
 
-  it("learn expands the newest note by default", async () => {
+  it("bare /ysk opens the all-notes popup", async () => {
+    const { deps, handler } = setup([note("a"), note("b")]);
+    await handler("", {});
+    expect(openPopupCalls(deps)).toEqual([{ all: true }]);
+    expect(deps.fillEditor).not.toHaveBeenCalled();
+    expect(deps.store.pending).toHaveLength(2); // nothing processed by opening
+  });
+
+  it("/ysk popup opens the all-notes popup too", async () => {
+    const { deps, handler } = setup([note("a"), note("b")]);
+    await handler("popup", {});
+    expect(openPopupCalls(deps)).toEqual([{ all: true }]);
+  });
+
+  it("learn opens that note's popup, newest by default", async () => {
     const { deps, handler } = setup([note("a"), note("b")]);
     await handler("learn", {});
-    expect(deps.expandNote).toHaveBeenCalledOnce();
-    expect((deps.expandNote as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toMatchObject({ topic: "b" });
+    expect(openPopupCalls(deps)).toEqual([expect.objectContaining({ topic: "b" })]);
   });
 
   it("learn resolves a 1-based index", async () => {
     const { deps, handler } = setup([note("a"), note("b")]);
     await handler("learn 1", {});
-    expect((deps.expandNote as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toMatchObject({ topic: "a" });
+    expect(openPopupCalls(deps)).toEqual([expect.objectContaining({ topic: "a" })]);
   });
 
-  it("learn warns when there is nothing to show", async () => {
+  it("/ysk popup with an index opens that note's detail popup", async () => {
+    const { deps, handler } = setup([note("a"), note("b")]);
+    await handler("popup 2", {});
+    expect(openPopupCalls(deps)).toEqual([expect.objectContaining({ topic: "b" })]);
+  });
+
+  it("learn warns and opens nothing when there is no pending note", async () => {
     const { deps, handler } = setup([]);
     await handler("learn", {});
-    expect(deps.expandNote).not.toHaveBeenCalled();
+    await handler("", {});
+    expect(deps.openPopup).not.toHaveBeenCalled();
     expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("No pending"), "warning");
   });
 
@@ -149,14 +178,16 @@ describe("wireActions", () => {
     expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("loud-topic"), "info");
   });
 
-  it("chat fills the editor with the note framed for manual sending", async () => {
+  it("chat fills the editor, marks the note processed, and reports the new wording", async () => {
     const { deps, handler } = setup([note("assumption")]);
     await handler("chat", {});
     expect(deps.fillEditor).toHaveBeenCalledOnce();
     const text = (deps.fillEditor as ReturnType<typeof vi.fn>).mock.calls[0]![0] as string;
     expect(text).toContain("Re: heads-up — please address");
     expect(text).toContain("Detail for assumption");
-    expect(deps.notify).toHaveBeenCalledWith("Note copied to the prompt — review and send when ready.", "info");
+    expect(deps.markProcessed).toHaveBeenCalledOnce();
+    expect((deps.markProcessed as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toMatchObject({ topic: "assumption" });
+    expect(deps.notify).toHaveBeenCalledWith("Note copied to the prompt — marked as processed.", "info");
   });
 
   it("dismiss hides the note for the session without persisting", async () => {
@@ -169,7 +200,7 @@ describe("wireActions", () => {
 
   it("status reports reviewer state through the injected status text", async () => {
     const { deps, handler } = setup([]);
-    await handler("", {});
+    await handler("status", {});
     expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("you-should-know status"), "info");
   });
 

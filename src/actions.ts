@@ -3,17 +3,17 @@
  *
  * Parsing (`parseYskArgs`) and note selection (`resolveNote`) are pure.
  * `wireActions` registers the /ysk command and delegates every side effect
- * to injected dependencies (store, expansion, editor fill, persistence,
- * rendering, notifications, status text), so the routing logic is testable
- * without a terminal or a session. The expansion and editor-fill adapters
- * themselves are implemented in index.ts, not here.
+ * to injected dependencies (store, popup opening, note processing, editor
+ * fill, persistence, rendering, notifications, status text), so the routing
+ * logic is testable without a terminal or a session. The popup and
+ * editor-fill adapters themselves are implemented in index.ts, not here.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { formatNotesForChat, type Note } from "./notes.ts";
 
 /** The /ysk sub-actions. Unknown input falls back to "status". */
-export type YskAction = "learn" | "known" | "chat" | "dismiss" | "status";
+export type YskAction = "learn" | "known" | "chat" | "dismiss" | "status" | "popup";
 
 export interface ParsedYskArgs {
   action: YskAction;
@@ -26,11 +26,11 @@ export interface ParsedYskArgs {
   hint?: string;
 }
 
-const ACTIONS: readonly YskAction[] = ["learn", "known", "chat", "dismiss", "status"];
+const ACTIONS: readonly YskAction[] = ["learn", "known", "chat", "dismiss", "status", "popup"];
 
 /**
  * Parse /ysk arguments, tolerantly:
- * - "" or whitespace -> status
+ * - "" or whitespace -> popup (the all-notes popup is the /ysk default)
  * - a known action word -> that action
  * - a bare number -> shorthand for `learn <n>`
  * - anything else -> status with a hint
@@ -39,7 +39,7 @@ const ACTIONS: readonly YskAction[] = ["learn", "known", "chat", "dismiss", "sta
  */
 export function parseYskArgs(raw: string): ParsedYskArgs {
   const tokens = (typeof raw === "string" ? raw : "").trim().split(/\s+/).filter(Boolean);
-  if (tokens.length === 0) return { action: "status" };
+  if (tokens.length === 0) return { action: "popup" };
 
   const [first, second] = tokens;
   const bareIndex = parseIndex(first);
@@ -81,10 +81,17 @@ export interface ActionDeps {
     isDismissed(topic: string): boolean;
   };
   /**
-   * Expand one note in the HUD widget band, in place (implemented in
-   * index.ts; acts only on the newest pending note, no-op otherwise).
+   * Open the note popup: a single note opens its detail stage directly, the
+   * { all: true } target opens the list of every pending note (implemented
+   * in index.ts; no-op without a TUI).
    */
-  expandNote: (note: Note) => void;
+  openPopup: (target: Note | { all: true }) => void;
+  /**
+   * Mark one note processed for this session: it leaves the pending tally
+   * (still reachable via /ysk status; permanent dismissal stays /ysk known).
+   * Implemented in index.ts as dismissSession + sidebar refresh.
+   */
+  markProcessed: (note: Note) => void;
   /**
    * Fill the prompt editor with composed text; the user reviews and sends
    * it manually (implemented in index.ts; nothing is auto-sent).
@@ -103,7 +110,7 @@ export interface ActionDeps {
 /** Register the /ysk command. The handler only parses, resolves, and delegates. */
 export function wireActions(pi: ExtensionAPI, deps: ActionDeps): void {
   pi.registerCommand("ysk", {
-    description: "you-should-know: /ysk [learn|known|chat|dismiss|status] [note#]",
+    description: "you-should-know: /ysk [learn|known|chat|dismiss|status|popup] [note#]",
     getArgumentCompletions: (prefix: string) =>
       ACTIONS.filter((action) => action.startsWith(prefix)).map((value) => ({ value, label: value })),
     handler: async (args: string) => {
@@ -122,8 +129,12 @@ export function wireActions(pi: ExtensionAPI, deps: ActionDeps): void {
       }
 
       switch (parsed.action) {
+        case "popup":
+          // Bare /ysk opens the all-notes popup; an index opens that note.
+          deps.openPopup(parsed.index === undefined ? { all: true } : note);
+          return;
         case "learn":
-          deps.expandNote(note);
+          deps.openPopup(note);
           return;
         case "known":
           deps.store.dismissPermanently(note.topic);
@@ -133,7 +144,8 @@ export function wireActions(pi: ExtensionAPI, deps: ActionDeps): void {
           return;
         case "chat":
           deps.fillEditor(`Re: heads-up — please address\n\n${formatNotesForChat([note])}`);
-          deps.notify("Note copied to the prompt — review and send when ready.", "info");
+          deps.markProcessed(note);
+          deps.notify("Note copied to the prompt — marked as processed.", "info");
           return;
         case "dismiss":
           deps.store.dismissSession(note.topic);

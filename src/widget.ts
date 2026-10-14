@@ -1,30 +1,22 @@
 /**
- * Pure widget line-building for the you-should-know HUD.
+ * Pure view models for the you-should-know sidebar + popup overlays.
  *
- * This module knows nothing about the terminal: `renderWidget` returns plain
- * strings and `widgetLines` returns structural rows that the TUI-facing
- * caller (index.ts) colors with theme tokens via `theme.fg()`. The severity
- * -> theme-token mapping is exported so the widget and its callers share one
- * source of truth (info=accent, warning=warning, critical=error; the pure
- * "muted" pseudo-severity marks de-emphasized rows such as the collapsed
- * "+N more" line).
+ * This module knows nothing about the terminal: every builder returns plain
+ * structural rows that the TUI-facing caller (index.ts) colors with theme
+ * tokens via `theme.fg()`. The severity -> theme-token mapping is exported so
+ * the callers share one source of truth (info=accent, warning=warning,
+ * critical=error; the pure "muted" pseudo-severity marks de-emphasized rows
+ * such as headers and hints).
  *
- * Layout: the widget is a two-state interactive band. Collapsed (default) it
- * shows the newest note as a one-to-two-row summary ("✦ Heads up · …"), an
- * optional muted "+N more · /ysk" row when older notes are pending, and the
- * collapsed action hint. Expanded (`expanded: true`) it renders the newest
- * note only: summary ("Heads up · …"), blank row, title, one row per detail
- * line, blank row, and the expanded action hint. `KEY_ACTIONS` is the single
- * source of truth for the action key labels so index.ts never hardcodes them.
+ * Layout: a right-edge tally sidebar (tallyBySeverity and sidebarRows,
+ * hit-tested via severityAtSidebarRow) and a mid-size popup with a list
+ * stage (popupListRows, noteIndexAtPopupRow) and a detail stage
+ * (popupDetailRows, popupActionAtRow). POPUP_ACTIONS is the single source of
+ * truth for the detail-stage action keys and labels.
  *
- * Sidebar/popup view models: the ysk-sidebar builders extend this module with
- * pure view models for the right-edge sidebar overlay (tallyBySeverity and
- * sidebarRows, hit-tested via severityAtSidebarRow) and the mid-size popup's
- * list stage (popupListRows, noteIndexAtPopupRow) and detail stage
- * (popupDetailRows, popupActionAtRow). They follow the same contract as the
- * band: no terminal or theme imports, rows carry Severity | "muted" tokens
- * for the caller to theme, and every row passes through truncateLine at the
- * caller's width. The hit-test helpers parse the produced row text (the
+ * Contract: no terminal or theme imports, rows carry Severity | "muted"
+ * tokens for the caller to theme, and every row passes through truncateLine
+ * at the caller's width. The hit-test helpers parse the produced row text (the
  * "<i>. " list prefix, each detail hint row's "<key>: <label>" prefix) so
  * row text stays the single source of truth for what is interactive.
  *
@@ -55,98 +47,16 @@ export function severityLabel(severity: Severity): string {
   return "info";
 }
 
-/**
- * Action key labels per widget state; single source of truth for index.ts.
- * @deprecatedSuperseded by sidebar/popup builders (T3 removes)
- */
-export const KEY_ACTIONS = {
-  collapsed: { learn: "1", known: "2", dismiss: "0" },
-  expanded: { understood: "1", chat: "2", dismiss: "0" },
-} as const;
-
-/** Prefix of the collapsed summary headline. */
-const COLLAPSED_PREFIX = "✦ Heads up · ";
-/** Prefix of the expanded summary headline. */
-const EXPANDED_PREFIX = "Heads up · ";
-
-/** Hints derive their digits from KEY_ACTIONS so the map stays authoritative. */
-const COLLAPSED_HINT = `${KEY_ACTIONS.collapsed.learn}: Learn more  ${KEY_ACTIONS.collapsed.known}: Knew this already  ${KEY_ACTIONS.collapsed.dismiss}: Dismiss`;
-const EXPANDED_HINT = `${KEY_ACTIONS.expanded.understood}: Understood  ${KEY_ACTIONS.expanded.chat}: Chat in main session  ${KEY_ACTIONS.expanded.dismiss}: Dismiss`;
-
-/** Options for widget rendering. */
+/** Options for view-model rendering. */
 export interface WidgetOptions {
   /** Truncate every line to this many characters. No truncation when absent. */
   width?: number;
-  /**
-   * Render the expanded single-note view instead of the collapsed band. Defaults to false.
-   * @deprecatedSuperseded by sidebar/popup builders (T3 removes)
-   */
-  expanded?: boolean;
 }
 
-/** One widget row: its text plus the severity that should color it. */
+/** One view-model row: its text plus the severity that should color it. */
 export interface WidgetLine {
   severity: Severity | "muted";
   text: string;
-}
-
-/**
- * Build the structural widget rows for the current widget state. Collapsed
- * (default): the newest note's summary, an optional muted "+N more · /ysk"
- * row when older notes are pending, then the collapsed hint. Expanded: the
- * newest note only (summary, blank, title, one row per detail line, blank,
- * expanded hint). Hidden callers passing [] get an empty array.
- *
- * @deprecatedSuperseded by sidebar/popup builders (T3 removes)
- */
-export function widgetLines(notes: Note[], options: WidgetOptions = {}): WidgetLine[] {
-  const list = Array.isArray(notes) ? notes : [];
-  if (list.length === 0) return [];
-
-  const newest = list[list.length - 1]!;
-  const rows =
-    options.expanded === true
-      ? expandedRows(newest, options.width)
-      : collapsedRows(newest, list.length - 1, options.width);
-  return rows.map((row) => ({ severity: row.severity, text: truncateLine(row.text, options.width) }));
-}
-
-/** Collapsed band rows: newest-note summary, optional "+N more", hint. */
-function collapsedRows(note: Note, olderCount: number, width: number | undefined): WidgetLine[] {
-  const rows = summaryRows(note, COLLAPSED_PREFIX, width);
-  if (olderCount > 0) rows.push({ severity: "muted", text: `+${olderCount} more · /ysk` });
-  rows.push({ severity: "info", text: COLLAPSED_HINT });
-  return rows;
-}
-
-/** Expanded rows for a single note: summary, blank, title, detail, blank, hint. */
-function expandedRows(note: Note, width: number | undefined): WidgetLine[] {
-  const rows = summaryRows(note, EXPANDED_PREFIX, width);
-  rows.push({ severity: "info", text: "" });
-  rows.push({ severity: note.severity, text: displayTitle(note) });
-  const detail = typeof note.detail === "string" ? note.detail.trim() : "";
-  if (detail.length > 0) {
-    for (const line of detail.split("\n")) rows.push({ severity: "info", text: line.trim() });
-  }
-  rows.push({ severity: "info", text: "" });
-  rows.push({ severity: "info", text: EXPANDED_HINT });
-  return rows;
-}
-
-/** Summary headline rows, colored with the note's own severity. */
-function summaryRows(note: Note, prefix: string, width: number | undefined): WidgetLine[] {
-  return wrapSummary(displayTitle(note), prefix, width).map((text) => ({
-    severity: note.severity,
-    text,
-  }));
-}
-
-/**
- * Render the widget to plain strings (no theme colors). Pair with
- * widgetLines + severityColorToken when the caller wants themed output.
- */
-export function renderWidget(notes: Note[], options: WidgetOptions = {}): string[] {
-  return widgetLines(notes, options).map((row) => row.text);
 }
 
 /**
@@ -167,46 +77,6 @@ function isUsableWidth(width: number | undefined): width is number {
   return typeof width === "number" && Number.isFinite(width) && width >= 1;
 }
 
-/**
- * Wrap a summary headline into at most two rows at the given width: the
- * prefix occupies the first row, words break only on spaces (never mid-word),
- * and a remainder that cannot fit is cut with an ellipsis. Without a usable
- * width the summary stays a single row (the caller skips truncation too).
- */
-function wrapSummary(summary: string, prefix: string, width: number | undefined): string[] {
-  if (!isUsableWidth(width)) return [`${prefix}${summary}`];
-  const bound = Math.floor(width);
-  const words = summary.split(/\s+/).filter((word) => word.length > 0);
-  if (words.length === 0) return [prefix.trimEnd()];
-
-  const firstEnd = fillWords(words, 0, Math.max(1, bound - prefix.length));
-  const rows = [prefix + words.slice(0, firstEnd).join(" ")];
-  if (firstEnd < words.length) {
-    const secondEnd = fillWords(words, firstEnd, bound);
-    const rest = words.slice(firstEnd, secondEnd).join(" ");
-    const overflow = words.slice(secondEnd).join(" ");
-    rows.push(overflow.length > 0 ? truncateLine(`${rest} ${overflow}`, bound) : rest);
-  }
-  return rows;
-}
-
-/**
- * Greedily consume words from `start` while they fit into `budget`. The
- * first word is always placed (a too-long word is truncated by the final
- * width pass instead of vanishing).
- */
-function fillWords(words: string[], start: number, budget: number): number {
-  let used = 0;
-  let index = start;
-  while (index < words.length) {
-    const next = index === start ? words[index]!.length : used + 1 + words[index]!.length;
-    if (index !== start && next > budget) break;
-    used = next;
-    index += 1;
-  }
-  return index;
-}
-
 /** Title to display: the note title, falling back to its topic when blank. */
 function displayTitle(note: Note): string {
   const title = typeof note.title === "string" ? note.title.trim() : "";
@@ -214,11 +84,11 @@ function displayTitle(note: Note): string {
 }
 
 // ---------------------------------------------------------------------------
-// Sidebar + popup view models (ysk-sidebar). Pure like the band builders: no
-// terminal or theme imports; rows carry the same Severity | "muted" tokens,
-// and every row passes through truncateLine at the caller's width. The
-// row-hit helpers parse the produced row text so row text stays the single
-// source of truth for what is interactive.
+// Sidebar + popup view models (ysk-sidebar). Pure: no terminal or theme
+// imports; rows carry the same Severity | "muted" tokens, and every row
+// passes through truncateLine at the caller's width. The row-hit helpers
+// parse the produced row text so row text stays the single source of truth
+// for what is interactive.
 // ---------------------------------------------------------------------------
 
 /** Per-severity pending-note counts backing the sidebar overlay. */
@@ -234,6 +104,24 @@ export type SidebarHit = "all" | Severity | null;
 /** Action named by a popup detail-stage hint entry. */
 export type PopupAction = "understood" | "chat" | "dismiss" | null;
 
+/** One actionable detail-stage entry: key, action name, and hint label. */
+export interface PopupActionEntry {
+  /** The key (and hint-row prefix digit) that triggers the action. */
+  key: string;
+  action: Exclude<PopupAction, null>;
+  label: string;
+}
+
+/**
+ * Detail-stage actions; single source of truth for the popup's keys, hint
+ * rows, and hit-testing (index.ts never hardcodes them).
+ */
+export const POPUP_ACTIONS: readonly PopupActionEntry[] = [
+  { key: "1", action: "understood", label: "Understood" },
+  { key: "2", action: "chat", label: "Chat in main session" },
+  { key: "0", action: "dismiss", label: "Dismiss" },
+];
+
 /** Prefix of the sidebar total headline. */
 const SIDEBAR_HEADER_PREFIX = "✦ ";
 /** Prefix of a sidebar per-severity count row. */
@@ -245,22 +133,14 @@ const POPUP_LIST_HINT = "number to open · Esc to close";
 
 /**
  * Detail-stage hint block: one muted row per action so every action is its
- * own click target. Digits derive from KEY_ACTIONS so the key map stays
+ * own click target. Rows derive from POPUP_ACTIONS so the action map stays
  * authoritative; popupActionAtRow parses these rows. Shared row objects are
  * safe: truncateAll always emits fresh copies.
  */
-const POPUP_HINT_ROWS: readonly WidgetLine[] = [
-  { severity: "muted", text: `${KEY_ACTIONS.expanded.understood}: Understood` },
-  { severity: "muted", text: `${KEY_ACTIONS.expanded.chat}: Chat in main session` },
-  { severity: "muted", text: `${KEY_ACTIONS.expanded.dismiss}: Dismiss` },
-];
-
-/** Map a detail hint label's leading word to its popup action name. */
-const POPUP_ACTION_BY_LABEL: Record<string, Exclude<PopupAction, null>> = {
-  understood: "understood",
-  chat: "chat",
-  dismiss: "dismiss",
-};
+const POPUP_HINT_ROWS: readonly WidgetLine[] = POPUP_ACTIONS.map((entry) => ({
+  severity: "muted",
+  text: `${entry.key}: ${entry.label}`,
+}));
 
 /**
  * Count pending notes per severity. Non-array input counts as empty so a
@@ -346,8 +226,8 @@ export function noteIndexAtPopupRow(rows: WidgetLine[], y: number): number | nul
  * <title>" header, a blank row, one info row per detail line (omitted when
  * the detail is blank), a blank row, and a muted three-row action hint
  * block (one row per action, so each action is its own click target). Hint
- * digits derive from the expanded band's KEY_ACTIONS labels so the key map
- * stays the single source of truth.
+ * rows derive from the exported POPUP_ACTIONS so the action map stays the
+ * single source of truth.
  */
 export function popupDetailRows(note: Note, options: WidgetOptions = {}): WidgetLine[] {
   if (note === null || typeof note !== "object") return [];
@@ -364,19 +244,23 @@ export function popupDetailRows(note: Note, options: WidgetOptions = {}): Widget
 
 /**
  * Resolve a 0-based popup detail line index to the action whose hint row
- * sits at that index, by parsing the row's "<key>: <label>" prefix, so the
- * hint text stays the single source of truth for the key -> action mapping
- * (1 -> understood, 2 -> chat, 0 -> dismiss). The header, blank rows,
- * detail rows, and anything out of range select no action (null). The hint
- * is the three-row block popupDetailRows emits: one independently
- * actionable row per action.
+ * sits there, by parsing the row's "<key>: <label>" prefix, so the hint
+ * text stays the single source of truth for the key -> action mapping
+ * (1 -> understood, 2 -> chat, 0 -> dismiss).
+ *
+ * POSITIONAL GUARD: only the trailing hint block (the last
+ * POPUP_ACTIONS.length rows, exactly the block popupDetailRows emits) is
+ * actionable. The header, blank rows, detail text, and anything out of
+ * range return null — so a detail line that merely starts "2: Chat …" can
+ * never trigger an action.
  */
 export function popupActionAtRow(rows: WidgetLine[], y: number): PopupAction {
-  const row = rowAt(rows, y);
-  const entry = row ? /^(\d+):\s+(.+)$/.exec(row.text) : null;
+  if (!Array.isArray(rows) || !Number.isInteger(y) || y < 0 || y >= rows.length) return null;
+  if (y < rows.length - POPUP_ACTIONS.length) return null; // only the trailing hint block hits
+  const entry = /^(\d+):\s+/.exec(rows[y]!.text);
   if (!entry) return null;
-  const label = entry[2]!.trim().split(/\s+/)[0]!.toLowerCase();
-  return POPUP_ACTION_BY_LABEL[label] ?? null;
+  const action = POPUP_ACTIONS.find((candidate) => candidate.key === entry[1])?.action;
+  return action ?? null;
 }
 
 /** The selected row, or undefined when rows/y are unusable. */
