@@ -101,3 +101,7 @@ feature range. Acceptance: verify PASS; review approved or corrections handled.
 
 | Task | Commit | Result |
 | ---- | ------ | ------ |
+| T1 view models | 2c04c5f | 165/165 green, tsc clean; tally/sidebar/list/detail builders + row-index hit-tests; detail hint = three per-action rows (click targets); band builders kept compiling, superseded; flagged: detail text starting "N: Label" could hit-test as action — guard positionally in T3 wiring |
+| T2 sidebar wiring | e14bc7a | 172/172 green, tsc clean; nonCapturing right-center overlay, snapshot-first render, done-capture close, generation guards, session cleanup, fillEditor repaint via sessionTui; band coexists until T3; risk noted: sync factory invocation assumed (same as band) |
+| T3 popup + processed | 0ef86bb | 165/165 green, tsc clean, grep acceptance met (no band/key remnants in src); popup list/detail stages, mouse+keys, kitty-safe Esc, positional hit-guard, processed semantics (understood+chat -> dismissSession), /ysk popup parity, smoke test updated via approved unblock (smoke surface added by parent decision); pi-tui re-added for matchesKey |
+| Verify corrections | 6c514ce | gentle-ai-verify CONDITIONAL PASS -> three gaps fixed: sidebar click-to-popup wired (severityAtSidebarRow -> openPopup all/severity), list stage newest-first, strict mode===tui sidebar guard + rpc test. 168/168 green, tsc clean |
