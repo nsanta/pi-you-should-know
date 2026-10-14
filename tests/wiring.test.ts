@@ -277,8 +277,15 @@ describe("you-should-know wiring", () => {
     await flush();
     expect(registry.calls()).toHaveLength(1);
     expect(ui.custom).toHaveBeenCalledOnce();
-    // Header + one row per non-zero severity, priority order, theme tokens applied.
-    expect(renderOf(customCalls[0]!)).toBe("<accent>✦ 2 heads-up\n<error>■ 1 critical\n<warning>■ 1 warning");
+    // Card frame + one body row per non-zero severity, priority order, theme tokens applied.
+    expect(renderOf(customCalls[0]!)).toBe(
+      [
+        "<border>╭─ <accent>✦ 2 heads-up<border> ─────────╮",
+        "<border>│ <error>■ 1 critical<border>           │",
+        "<border>│ <warning>■ 1 warning<border>            │",
+        "<border>╰────────────────────────╯",
+      ].join("\n"),
+    );
 
     // Counter reset: two more steps trigger exactly one more review.
     handlers.get("tool_execution_end")![0](toolEndEvent("c"), ctx);
@@ -553,7 +560,7 @@ describe("you-should-know answer-completion presentation", () => {
 // --- tally sidebar overlay (T2) ------------------------------------------------
 
 describe("you-should-know tally sidebar overlay", () => {
-  it("opens one non-capturing right-center overlay when notes are presented after agent_end, rendering themed tally rows", async () => {
+  it("opens one non-capturing right-center overlay when notes are presented after agent_end, rendering the themed tally card", async () => {
     const { ui, customCalls, handlers, ctx } = await setup({ config: { reviewEvery: 1 } });
     handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
     handlers.get("tool_execution_end")![0](toolEndEvent("a"), ctx);
@@ -570,11 +577,12 @@ describe("you-should-know tally sidebar overlay", () => {
       margin: 1,
       nonCapturing: true,
     });
-    // Header + one row per non-zero severity, priority order, theme tokens applied.
+    // Card frame + one body row per non-zero severity, priority order, theme tokens applied.
     expect(open.component.render?.(100)).toEqual([
-      "<accent>✦ 2 heads-up",
-      "<error>■ 1 critical",
-      "<warning>■ 1 warning",
+      "<border>╭─ <accent>✦ 2 heads-up<border> ─────────╮",
+      "<border>│ <error>■ 1 critical<border>           │",
+      "<border>│ <warning>■ 1 warning<border>            │",
+      "<border>╰────────────────────────╯",
     ]);
   });
 

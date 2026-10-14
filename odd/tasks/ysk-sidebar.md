@@ -97,6 +97,18 @@ headless no-ops; bare /ysk opens popup.
 README sidebar/click docs; /ysk status wording; gentle-ai-verify; native review of the
 feature range. Acceptance: verify PASS; review approved or corrections handled.
 
+### T5. Card-frame sidebar restyle (user-requested 2026-10-14)
+`src/widget.ts` + `src/index.ts`: replace the bare tally rows with a gentle-pi-style
+rounded card (reference: user screenshot of gentle shell Status/Todos cards; geometry
+mirrors gentle-pi lib/shell-card.ts): `╭─ ✦ N heads-up ─╮` top rule (frame painted
+with the theme `border` role, title with accent), `│ ■ <count> <severity> │` body
+rows, `╰──╯` bottom rule; SIDEBAR_WIDTH stays 26. New pure builders:
+`sidebarCardRows` (CardRow segments with tokens incl. new `border` SeverityToken;
+width-required) + `severityAtSidebarCardRow` (y=0 title -> all, body rows ->
+severity, bottom rule -> null); superseded `sidebarRows`/`severityAtSidebarRow`
+deleted. Popup unchanged. Tests red first. Acceptance: card geometry exact at
+SIDEBAR_WIDTH; click hit-tests still pass (row shift accounted); suite + tsc green.
+
 ## Evidence
 
 | Task | Commit | Result |
@@ -106,3 +118,4 @@ feature range. Acceptance: verify PASS; review approved or corrections handled.
 | T3 popup + processed | 0ef86bb | 165/165 green, tsc clean, grep acceptance met (no band/key remnants in src); popup list/detail stages, mouse+keys, kitty-safe Esc, positional hit-guard, processed semantics (understood+chat -> dismissSession), /ysk popup parity, smoke test updated via approved unblock (smoke surface added by parent decision); pi-tui re-added for matchesKey |
 | Verify corrections | 6c514ce | gentle-ai-verify CONDITIONAL PASS -> three gaps fixed: sidebar click-to-popup wired (severityAtSidebarRow -> openPopup all/severity), list stage newest-first, strict mode===tui sidebar guard + rpc test. 168/168 green, tsc clean |
 | Native review | lineage: NONE — blocked | START over committed range b742e691..HEAD rejected 3x: controller returns empty-candidate workspace status (empty_candidate_base_ref_required) without creating a lineage; untracked selection (.pi/you-should-know.json) resolved via select-intended-untracked; START loop stopped per contract. No authority created or burned. Feature otherwise verified (168/168, tsc clean, API cross-check, adversarial sweep clean). Retry in a fresh session or via maintainer CLI. |
+| T5 card restyle | (this commit) | gentle-ai-worker TDD (red -> green), gentle-ai-verify PASS (geometry matches gentle-pi shell-card arithmetic; popup untouched); degenerate-width coverage gap closed by parent; 169/169 green, tsc clean |

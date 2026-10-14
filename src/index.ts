@@ -4,10 +4,10 @@
  * A quiet background reviewer: every `reviewEvery` completed tool steps it
  * sends a bounded transcript digest to a nested model call
  * (ctx.modelRegistry.streamSimple) and surfaces findings as non-blocking
- * notes through two overlays: a right-edge tally sidebar (always mirroring
- * the pending store) and a centered popup (note list/detail with 1/2/0
- * actions). Notes become visible only when the chat answer completes: while
- * the agent loop is active (agent_start..agent_end) every sidebar write is
+ * notes through two overlays: a right-edge tally sidebar card (always
+ * mirroring the pending store) and a centered popup (note list/detail with
+ * 1/2/0 actions). Notes become visible only when the chat answer completes:
+ * while the agent loop is active (agent_start..agent_end) every sidebar write is
  * deferred behind a dirty flag and flushed on agent_end / agent_settled, so
  * mid-task tool rounds never leak notes. Core logic (step counting,
  * reviewing, the note store) runs in every mode; only sidebar, popup,
@@ -43,9 +43,10 @@ import {
   popupActionAtRow,
   popupDetailRows,
   popupListRows,
-  severityAtSidebarRow,
+  severityAtSidebarCardRow,
   severityColorToken,
-  sidebarRows,
+  sidebarCardRows,
+  type CardRow,
   type WidgetLine,
 } from "./widget.ts";
 
@@ -114,7 +115,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   let sidebarDone: ((value: unknown) => void) | null = null;
   let sidebarHandle: OverlayHandleLike | null = null;
   let sessionTui: { requestRender: (force?: boolean) => void } | null = null;
-  let sidebarSnapshot: WidgetLine[] = [];
+  let sidebarSnapshot: CardRow[] = [];
   // Note popup overlay state (session-scoped, same done-capture pattern).
   // One popup at a time: opening a new one closes the previous first.
   let popupDone: ((value: unknown) => void) | null = null;
@@ -155,7 +156,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     if (!ctx) return;
     try {
       if (!ctx.hasUI || ctx.mode !== "tui") return;
-      sidebarSnapshot = sidebarRows(store.pending, { width: SIDEBAR_WIDTH });
+      sidebarSnapshot = sidebarCardRows(store.pending, { width: SIDEBAR_WIDTH });
       if (sidebarSnapshot.length === 0) {
         // Empty tally and an open overlay: close it through pi's own done
         // (resolved + disposed by pi) and drop the handle so nothing stale
@@ -203,16 +204,19 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
           render: () => {
             if (gen !== generation) return []; // stale generation renders nothing
             // Frames redraw constantly: render only from the snapshot.
-            return sidebarSnapshot.map((row) => theme.fg(severityColorToken(row.severity), row.text));
+            return sidebarSnapshot.map((row) =>
+              row.segments.map((segment) => theme.fg(severityColorToken(segment.token), segment.text)).join(""),
+            );
           },
           invalidate: () => {},
           handleMouse: (event) => {
             if (gen !== generation) return undefined;
             if (event?.type !== "click" || event.button !== "left") return undefined;
-            // Click routing: row text decides what a click selects. The
-            // overlay is nonCapturing, so opening the popup never steals
+            // Click routing: the card rows decide what a click selects
+            // (title -> all, a body row's middle segment -> its severity).
+            // The overlay is nonCapturing, so opening the popup never steals
             // focus from the editor beforehand — the popup captures its own.
-            const hit = severityAtSidebarRow(sidebarSnapshot, event.y);
+            const hit = severityAtSidebarCardRow(sidebarSnapshot, event.y);
             if (hit === null) return undefined;
             openPopup(hit === "all" ? { all: true } : { severity: hit });
             return { handled: true };

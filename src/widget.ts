@@ -8,17 +8,20 @@
  * critical=error; the pure "muted" pseudo-severity marks de-emphasized rows
  * such as headers and hints).
  *
- * Layout: a right-edge tally sidebar (tallyBySeverity and sidebarRows,
- * hit-tested via severityAtSidebarRow) and a mid-size popup with a list
+ * Layout: a right-edge tally sidebar card (tallyBySeverity and
+ * sidebarCardRows, hit-tested via severityAtSidebarCardRow) and a mid-size
+ * popup with a list
  * stage (popupListRows, noteIndexAtPopupRow) and a detail stage
  * (popupDetailRows, popupActionAtRow). POPUP_ACTIONS is the single source of
  * truth for the detail-stage action keys and labels.
  *
  * Contract: no terminal or theme imports, rows carry Severity | "muted"
- * tokens for the caller to theme, and every row passes through truncateLine
- * at the caller's width. The hit-test helpers parse the produced row text (the
- * "<i>. " list prefix, each detail hint row's "<key>: <label>" prefix) so
- * row text stays the single source of truth for what is interactive.
+ * tokens (the sidebar card additionally carries "border" frame runs) for the
+ * caller to theme, and every row passes through truncateLine at the caller's
+ * width. The hit-test helpers read the produced rows themselves — the
+ * sidebar card's segment tokens and the popup's row-text prefixes (the
+ * "<i>. " list prefix, each detail hint row's "<key>: <label>") — so the
+ * rendered rows stay the single source of truth for what is interactive.
  *
  * Width handling: we deliberately implement conservative CHARACTER-count
  * truncation: every produced line is at most `width` characters. Glyph
@@ -29,14 +32,15 @@
 
 import { type Note, type Severity } from "./notes.ts";
 
-/** Theme token used per severity; applied by the caller via theme.fg(). */
-export type SeverityToken = "accent" | "warning" | "error" | "muted";
+/** Theme token used per severity or card-frame segment; applied via theme.fg(). */
+export type SeverityToken = "accent" | "warning" | "error" | "muted" | "border";
 
-/** Pure severity -> theme-token mapping (caller-side theming hook). */
-export function severityColorToken(severity: Severity | "muted"): SeverityToken {
+/** Pure severity/card-segment -> theme-token mapping (caller-side theming hook). */
+export function severityColorToken(severity: Severity | SeverityToken): SeverityToken {
   if (severity === "warning") return "warning";
   if (severity === "critical") return "error";
   if (severity === "muted") return "muted";
+  if (severity === "border") return "border";
   return "accent";
 }
 
@@ -85,10 +89,10 @@ function displayTitle(note: Note): string {
 
 // ---------------------------------------------------------------------------
 // Sidebar + popup view models (ysk-sidebar). Pure: no terminal or theme
-// imports; rows carry the same Severity | "muted" tokens, and every row
-// passes through truncateLine at the caller's width. The row-hit helpers
-// parse the produced row text so row text stays the single source of truth
-// for what is interactive.
+// imports; rows carry Severity | "muted" tokens (the sidebar card adds
+// "border" frame runs), and rows pass through truncateLine at the caller's
+// width. The row-hit helpers read the produced rows (segment tokens or row
+// text) so the rows stay the single source of truth for what is interactive.
 // ---------------------------------------------------------------------------
 
 /** Per-severity pending-note counts backing the sidebar overlay. */
@@ -100,6 +104,19 @@ export interface SeverityTally {
 
 /** What a sidebar row selects: the header covers all severities at once. */
 export type SidebarHit = "all" | Severity | null;
+
+/** One themed run of text inside a card row. */
+export interface CardSegment {
+  /** Theme token for this run: the row's severity, or "border" for frame runs. */
+  token: Severity | "border";
+  /** Literal text; glyphs count as one cell each (the module's character convention). */
+  text: string;
+}
+
+/** One card row: an ordered list of segments the caller renders left to right. */
+export interface CardRow {
+  segments: CardSegment[];
+}
 
 /** Action named by a popup detail-stage hint entry. */
 export type PopupAction = "understood" | "chat" | "dismiss" | null;
@@ -156,37 +173,83 @@ export function tallyBySeverity(notes: Note[]): SeverityTally {
   return tally;
 }
 
-/**
- * Sidebar overlay rows: an accent total header ("✦ <total> heads-up", or
- * "head-up" in the singular) followed by one row per non-zero severity in
- * priority order (critical, warning, info) as "■ <count> <label>". No notes
- * means no sidebar: [].
- */
-export function sidebarRows(notes: Note[], options: WidgetOptions = {}): WidgetLine[] {
-  const tally = tallyBySeverity(notes);
-  const total = tally.critical + tally.warning + tally.info;
-  if (total === 0) return [];
-
-  const unit = total === 1 ? "head-up" : "heads-up";
-  const rows: WidgetLine[] = [{ severity: "info", text: `${SIDEBAR_HEADER_PREFIX}${total} ${unit}` }];
-  for (const severity of SIDEBAR_SEVERITY_ORDER) {
-    const count = tally[severity];
-    if (count > 0) rows.push({ severity, text: `${SIDEBAR_ROW_PREFIX}${count} ${severityLabel(severity)}` });
-  }
-  return truncateAll(rows, options.width);
+/** The card frame width: finite numbers floor to an integer; anything else degenerates to 0. */
+function cardWidth(width: number | undefined): number {
+  return typeof width === "number" && Number.isFinite(width) ? Math.floor(width) : 0;
 }
 
 /**
- * Resolve a 0-based component-local sidebar line index to what it selects:
- * the header row covers all severities ("all"), a count row its severity,
- * and anything out of range selects nothing (null).
+ * Sidebar card rows: the gentle-pi-style rounded card framing the pending
+ * tally. The top rule reads "╭─ ✦ <total> heads-up ─…╮" (frame in the
+ * "border" token, title in "info"/accent; singular "head-up" when total is
+ * 1), one body row per non-zero severity in priority order (critical,
+ * warning, info) as "│ ■ <count> <label> …│", then "╰──…╯". The title is
+ * truncated to width − 5 characters and body text to width − 4
+ * (truncateLine semantics) so fill/padding keep every row at exactly
+ * `width` columns (both clamp at 0). Widths below 5 degenerate to bare
+ * clamped rules (the gentle-pi cardTop narrow branches: the title and body
+ * cannot fit and drop). No notes, or unusable notes input, means no
+ * sidebar: [].
  */
-export function severityAtSidebarRow(rows: WidgetLine[], y: number): SidebarHit {
-  const row = rowAt(rows, y);
-  if (!row) return null;
+export function sidebarCardRows(notes: Note[], options: { width: number }): CardRow[] {
+  const tally = tallyBySeverity(notes);
+  const total = tally.critical + tally.warning + tally.info;
+  const width = cardWidth(options?.width);
+  if (total === 0) return [];
+
+  if (width < 5) {
+    // Degenerate frame, mirroring gentle-pi cardTop's narrow branches: the
+    // title and body cannot fit, so only clamped bare rules render.
+    const dashes = "─".repeat(Math.max(0, width - 2));
+    const top = width === 1 ? "╭" : `╭${dashes}╮`;
+    const bottom = width === 1 ? "╰" : `╰${dashes}╯`;
+    return [
+      { segments: [{ token: "border", text: top }] },
+      { segments: [{ token: "border", text: bottom }] },
+    ];
+  }
+
+  const unit = total === 1 ? "head-up" : "heads-up";
+  const title = truncateLine(`${SIDEBAR_HEADER_PREFIX}${total} ${unit}`, width - 5);
+  const rows: CardRow[] = [
+    {
+      segments: [
+        { token: "border", text: "╭─ " },
+        { token: "info", text: title },
+        { token: "border", text: ` ${"─".repeat(Math.max(0, width - title.length - 5))}╮` },
+      ],
+    },
+  ];
+  for (const severity of SIDEBAR_SEVERITY_ORDER) {
+    const count = tally[severity];
+    if (count > 0) {
+      const body = truncateLine(`${SIDEBAR_ROW_PREFIX}${count} ${severityLabel(severity)}`, width - 4);
+      const padding = " ".repeat(Math.max(0, width - 4 - body.length));
+      rows.push({
+        segments: [
+          { token: "border", text: "│ " },
+          { token: severity, text: body },
+          { token: "border", text: `${padding} │` },
+        ],
+      });
+    }
+  }
+  rows.push({ segments: [{ token: "border", text: `╰${"─".repeat(Math.max(0, width - 2))}╯` }] });
+  return rows;
+}
+
+/**
+ * Resolve a 0-based component-local sidebar card line index to what it
+ * selects: the top rule covers all severities ("all"), a body row its
+ * middle segment's severity (info/warning/critical), and the bottom rule,
+ * non-integer indices, and anything out of range select nothing (null).
+ */
+export function severityAtSidebarCardRow(rows: CardRow[], y: number): SidebarHit {
+  if (!Array.isArray(rows) || rows.length === 0 || !Number.isInteger(y) || y < 0 || y >= rows.length) return null;
   if (y === 0) return "all";
-  const severity = row.severity;
-  return severity === "muted" ? null : severity;
+  if (y === rows.length - 1) return null; // the bottom rule never selects
+  const token = rows[y]!.segments[1]?.token;
+  return token === "critical" || token === "warning" || token === "info" ? token : null;
 }
 
 /**
