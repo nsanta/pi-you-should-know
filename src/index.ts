@@ -34,11 +34,13 @@ import { formatNotesForChat, NoteStore, type Note } from "./notes.ts";
 import { buildDigest, runReviewer, type ReviewerRequest } from "./reviewer.ts";
 import { StepCounter } from "./steps.ts";
 import { registerHeadsUpTool } from "./tool.ts";
-import { KEY_ACTIONS, severityColorToken, widgetLines } from "./widget.ts";
+import { KEY_ACTIONS, severityColorToken, sidebarRows, widgetLines, type WidgetLine } from "./widget.ts";
 
 const WIDGET_ID = "ysk";
 const USER_CONFIG_PATH = "~/.pi/agent/you-should-know.json";
 const DEFAULT_WIDGET_WIDTH = 100;
+/** Column width of the tally sidebar overlay; rows are truncated to this. */
+const SIDEBAR_WIDTH = 26;
 
 /**
  * The streamSimple adapter surface, derived structurally from the installed
@@ -47,6 +49,19 @@ const DEFAULT_WIDGET_WIDTH = 100;
 type StreamSimpleFn = ExtensionContext["modelRegistry"]["streamSimple"];
 type ReviewerModel = Parameters<StreamSimpleFn>[0];
 type SimpleStreamOptions = Parameters<StreamSimpleFn>[2];
+
+/**
+ * The subset of pi's OverlayHandle the sidebar keeps. Structurally derived
+ * so tests can pass minimal fakes and this file never imports pi-tui
+ * directly; T3 click routing consumes the bounds/focus surface.
+ */
+interface OverlayHandleLike {
+  hide(): void;
+  setHidden(hidden: boolean): void;
+  focus(): void;
+  unfocus(): void;
+  getBounds(): { row: number; col: number; width: number; height: number } | undefined;
+}
 
 /** Default export: the extension factory (sync; no heavy work, no I/O). */
 export default function youShouldKnowExtension(pi: ExtensionAPI): void {
@@ -80,6 +95,17 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   // the widget is later cleared; null in headless/RPC contexts, where the
   // factory never runs.
   let widgetTui: { requestRender: (force?: boolean) => void } | null = null;
+  // Tally sidebar overlay state (session-scoped). sidebarDone is pi's own
+  // done callback captured inside the custom() factory: resolving it closes
+  // and disposes the overlay, so the empty-snapshot path closes through pi
+  // instead of tearing UI down by hand. sidebarHandle is the overlay handle
+  // for T3 click routing; sessionTui is the live TUI captured by the sidebar
+  // factory (preferred repaint target for editor fills); sidebarSnapshot is
+  // the immutable row list every overlay frame renders from.
+  let sidebarDone: ((value: unknown) => void) | null = null;
+  let sidebarHandle: OverlayHandleLike | null = null;
+  let sessionTui: { requestRender: (force?: boolean) => void } | null = null;
+  let sidebarSnapshot: WidgetLine[] = [];
 
   // Persistence of permanent dismissals flows through the /ysk ActionDeps
   // (`persist` below), the single write path; no store-level callback.
@@ -99,6 +125,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       return;
     }
     writeWidget(ctx);
+    writeSidebar(ctx);
   }
 
   /** The actual widget writer; safe to call repeatedly (idempotent output). */
@@ -145,6 +172,115 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     }
   }
 
+  // --- tally sidebar overlay ------------------------------------------------
+
+  /**
+   * Sidebar writer: snapshot the pending-note tally, then open, refresh, or
+   * close the right-edge overlay so it always mirrors the store. Lives on the
+   * same gated render path as the band (idle requestRender + loop-boundary
+   * flush), so mid-loop arrivals stay deferred behind the dirty flag. The
+   * snapshot is taken before any UI touch and every overlay frame renders
+   * from it, so a frame redraw can never leak newer store state (same
+   * invariant as the band).
+   */
+  function writeSidebar(ctx: ExtensionContext | null): void {
+    if (!ctx) return;
+    try {
+      if (!ctx.hasUI) return;
+      sidebarSnapshot = sidebarRows(store.pending, { width: SIDEBAR_WIDTH });
+      if (sidebarSnapshot.length === 0) {
+        // Empty tally and an open overlay: close it through pi's own done
+        // (resolved + disposed by pi) and drop the handle so nothing stale
+        // can touch the UI. Do not call custom() again until a new note lands.
+        if (sidebarDone !== null) {
+          const finish = sidebarDone;
+          sidebarDone = null;
+          sidebarHandle = null;
+          try {
+            finish(undefined);
+          } catch {
+            // quiet: overlay disposal is best-effort
+          }
+        }
+        return;
+      }
+      if (sidebarDone !== null) {
+        // Already open: the component re-renders every frame from the fresh
+        // snapshot; just ask its TUI to repaint.
+        sessionTui?.requestRender();
+        return;
+      }
+      openSidebar(ctx);
+    } catch {
+      // sidebar failures must never crash the session
+    }
+  }
+
+  /**
+   * Open the tally sidebar as a non-capturing right-center overlay. The
+   * custom() promise is fire-and-forget with a quiet catch; done is captured
+   * inside the factory so the empty-snapshot path can close the overlay
+   * through pi later. Every deferred callback is generation-guarded: a stale
+   * session must not open, repaint, or capture UI state.
+   */
+  function openSidebar(ctx: ExtensionContext): void {
+    const gen = generation;
+    void ctx.ui.custom(
+      (tui, theme, _keybindings, done) => {
+        sessionTui = tui; // plain assignment FIRST: capture even if the rest fails
+        sidebarDone = done; // pi's own resolve: the close path hands it back
+        return {
+          render: () => {
+            if (gen !== generation) return []; // stale generation renders nothing
+            // Frames redraw constantly: render only from the snapshot.
+            return sidebarSnapshot.map((row) => theme.fg(severityColorToken(row.severity), row.text));
+          },
+          invalidate: () => {},
+          handleMouse: (event) => {
+            void event; // click routing arrives in T3; keep the hook so the surface exists
+            return undefined;
+          },
+        };
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          anchor: "right-center",
+          width: SIDEBAR_WIDTH,
+          maxHeight: "80%",
+          margin: 1,
+          nonCapturing: true,
+        },
+        onHandle: (handle) => {
+          if (gen !== generation) return; // stale generation must not capture the handle
+          sidebarHandle = handle;
+        },
+      },
+    ).catch(() => {
+      // quiet: a failed overlay open must never crash the session
+    });
+  }
+
+  /**
+   * Close any open sidebar overlay and clear every sidebar surface state.
+   * Used at session boundaries (session_start replacement, session_shutdown):
+   * the captured done is invoked quiet so pi disposes the overlay, and the
+   * next session reopens on demand.
+   */
+  function resetSidebar(): void {
+    const finish = sidebarDone;
+    sidebarDone = null;
+    sidebarHandle = null;
+    sessionTui = null;
+    sidebarSnapshot = [];
+    if (!finish) return;
+    try {
+      finish(undefined);
+    } catch {
+      // quiet: overlay disposal at a session boundary is best-effort
+    }
+  }
+
   // --- session lifecycle ---------------------------------------------------
 
   pi.on("session_start", (_event: SessionStartEvent, ctx: ExtensionContext) => initSession(ctx));
@@ -156,6 +292,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     currentController = null;
     agentActive = false;
     renderDirty = false;
+    resetSidebar(); // close the replaced session's overlay; the new one reopens on demand
     counter = new StepCounter();
     try {
       const cwd = typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
@@ -188,6 +325,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     inFlight = false;
     agentActive = false;
     renderDirty = false;
+    resetSidebar();
     unsubscribeTerminalInput();
     ctxRef = null;
   });
@@ -216,6 +354,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     if (!renderDirty) return;
     renderDirty = false;
     writeWidget(ctx);
+    writeSidebar(ctx);
   }
 
   // --- terminal-input key layer (TUI-only) ----------------------------------
@@ -415,11 +554,11 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     try {
       ctx.ui.setEditorText(text);
       // setEditorText only mutates editor state; ask the TUI captured by the
-      // widget factory for the repaint so the note is visible immediately.
-      // Upstream gap tracked in earendil-works/pi#5620 (setEditorText does
-      // not re-render outside the input loop); if that fix lands, the
-      // requestRender here becomes redundant but harmless.
-      widgetTui?.requestRender();
+      // sidebar (preferred) or band factory for the repaint so the note is
+      // visible immediately. Upstream gap tracked in earendil-works/pi#5620
+      // (setEditorText does not re-render outside the input loop); if that
+      // fix lands, the requestRender here becomes redundant but harmless.
+      (sessionTui ?? widgetTui)?.requestRender();
     } catch {
       // editor fill is best-effort and must never crash the session
     }

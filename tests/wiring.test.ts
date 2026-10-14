@@ -74,14 +74,49 @@ function fakeModelRegistry(outcome: StreamOutcome = {}) {
   };
 }
 
-function mockCtx(registry: ReturnType<typeof fakeModelRegistry>, overrides: Record<string, unknown> = {}) {
+/** One recorded ui.custom overlay open: the component plus its contract pieces. */
+interface RecordedCustomOpen {
+  component: { render?: (width?: number) => string[]; invalidate?: () => void; handleMouse?: (event: unknown) => unknown };
+  opts: Record<string, unknown> | undefined;
+  fakeTui: { requestRender: ReturnType<typeof vi.fn> };
+  /** Spy-wrapped done/resolve: invoking it resolves the overlay promise. */
+  resolve: ReturnType<typeof vi.fn>;
+}
+
+function mockCtx(
+  registry: ReturnType<typeof fakeModelRegistry>,
+  overrides: Record<string, unknown> = {},
+) {
   /** One unique unsubscribe spy per onTerminalInput subscription. */
   const unsubscribers: Array<ReturnType<typeof vi.fn>> = [];
+  /** Every ui.custom open, in order, with the pieces the overlay contract hands out. */
+  const customCalls: RecordedCustomOpen[] = [];
+  /** OverlayHandle stand-in handed to every open's onHandle. */
+  const fakeHandle = {
+    hide: vi.fn(),
+    setHidden: vi.fn(),
+    focus: vi.fn(),
+    unfocus: vi.fn(),
+    getBounds: vi.fn(() => undefined),
+  };
+  /** The TUI instance the factory receives (pi hands the live TUI). */
+  const fakeOverlayTui = { requestRender: vi.fn() };
   const ui = {
     notify: vi.fn(),
     setWidget: vi.fn(),
     setEditorText: vi.fn(),
-    custom: vi.fn(async (..._args: unknown[]) => undefined),
+    // pi's overlay contract: onHandle fires with the handle, the factory gets
+    // (tui, theme, keybindings, done) and done resolves the promise. done is
+    // spy-wrapped so tests can assert overlay dismissal.
+    custom: vi.fn(
+      (factory: any, opts: any): Promise<unknown> =>
+        new Promise((resolve) => {
+          const done = vi.fn((value: unknown) => resolve(value));
+          opts?.onHandle?.(fakeHandle);
+          const component = factory(fakeOverlayTui, fakeTheme, undefined, done);
+          customCalls.push({ component, opts, fakeTui: fakeOverlayTui, resolve: done });
+        }),
+    ),
     onTerminalInput: vi.fn((_handler: unknown) => {
       const unsubscribe = vi.fn();
       unsubscribers.push(unsubscribe);
@@ -101,7 +136,7 @@ function mockCtx(registry: ReturnType<typeof fakeModelRegistry>, overrides: Reco
     model: { provider: "sess", id: "session-model" },
     ...overrides,
   };
-  return { ctx, ui, unsubscribers };
+  return { ctx, ui, unsubscribers, customCalls, fakeOverlayTui, fakeHandle };
 }
 
 async function setup(
@@ -130,10 +165,25 @@ async function setup(
     },
   };
   const registry = fakeModelRegistry(options.outcome);
-  const { ctx, ui, unsubscribers } = mockCtx(registry, { hasUI: options.hasUI ?? true, ...options.ctxOverrides });
+  const { ctx, ui, unsubscribers, customCalls, fakeOverlayTui, fakeHandle } = mockCtx(registry, {
+    hasUI: options.hasUI ?? true,
+    ...options.ctxOverrides,
+  });
   youShouldKnowExtension(pi as never);
   await handlers.get("session_start")![0]({ type: "session_start", reason: "startup" }, ctx);
-  return { registry, ctx, ui, unsubscribers, sent, tools, commands, handlers };
+  return {
+    registry,
+    ctx,
+    ui,
+    unsubscribers,
+    customCalls,
+    fakeOverlayTui,
+    fakeHandle,
+    sent,
+    tools,
+    commands,
+    handlers,
+  };
 }
 
 const flush = async (): Promise<void> => {
@@ -364,11 +414,14 @@ describe("you-should-know wiring", () => {
     expect(collapsed).toContain("Learn more");
     expect(collapsed).not.toContain("Understood");
 
-    // The modal overlay is gone: no /ysk action may touch ui.custom.
+    // The modal popup overlay is gone: no /ysk action may open anything NEW.
+    // (Since T2 the tally sidebar legitimately owns its own ui.custom overlay,
+    // which the renders above already opened; it must stay the only one.)
+    const customOpensBefore = ui.custom.mock.calls.length;
     await commands.get("ysk").handler("status", ctx);
     await commands.get("ysk").handler("chat", ctx);
     await commands.get("ysk").handler("dismiss", ctx);
-    expect(ui.custom).not.toHaveBeenCalled();
+    expect(ui.custom.mock.calls).toHaveLength(customOpensBefore);
   });
 
   it("headless /ysk learn does nothing UI-wise and does not throw", async () => {
@@ -517,15 +570,23 @@ describe("you-should-know wiring", () => {
   });
 
   it("expanded '2' requests a TUI render after filling the editor (stale-screen fix)", async () => {
-    const { ui, handler } = await setupWithPendingNote({}, "Deployment gate is manual\ndetail body", "warning");
-    handler("1"); // expand: the most recent widget write uses the factory overload
-    const tui = lastWidgetTui(ui);
-    expect(tui).toBeDefined(); // a live tui was captured from the factory
+    const { ui, customCalls, handler } = await setupWithPendingNote(
+      {},
+      "Deployment gate is manual\ndetail body",
+      "warning",
+    );
+    handler("1"); // expand
+    // The repaint goes to whichever TUI the HUD captured: the sidebar overlay's
+    // (open since the note was presented) or, failing that, the band's.
+    const repaintCount = (): number =>
+      (customCalls.at(-1)?.fakeTui.requestRender.mock.calls.length ?? 0) +
+      (lastWidgetTui(ui)?.requestRender.mock.calls.length ?? 0);
+    const before = repaintCount();
 
     expect(handler("2")).toEqual({ consume: true });
     expect(ui.setEditorText).toHaveBeenCalledOnce();
-    // setEditorText alone never repaints; the captured tui must be asked to.
-    expect(tui!.requestRender).toHaveBeenCalledOnce();
+    // setEditorText alone never repaints; exactly one captured tui must be asked to.
+    expect(repaintCount()).toBe(before + 1);
   });
 
   it("headless mode never captures a widget tui: setWidget is never called with a factory", async () => {
@@ -657,5 +718,118 @@ describe("you-should-know answer-completion presentation", () => {
 
     handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
     expect(lastWidgetArg(ui)).toBeUndefined(); // flushed: empty band clears the widget
+  });
+});
+
+// --- tally sidebar overlay (T2) ------------------------------------------------
+
+describe("you-should-know tally sidebar overlay", () => {
+  it("opens one non-capturing right-center overlay when notes are presented after agent_end, rendering themed tally rows", async () => {
+    const { ui, customCalls, handlers, ctx } = await setup({ config: { reviewEvery: 1 } });
+    handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
+    handlers.get("tool_execution_end")![0](toolEndEvent("a"), ctx);
+    await flush();
+
+    handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
+    expect(ui.custom).toHaveBeenCalledOnce();
+    const open = customCalls[0]!;
+    expect(open.opts?.overlay).toBe(true);
+    expect(open.opts?.overlayOptions).toEqual({
+      anchor: "right-center",
+      width: 26,
+      maxHeight: "80%",
+      margin: 1,
+      nonCapturing: true,
+    });
+    // Header + one row per non-zero severity, priority order, theme tokens applied.
+    expect(open.component.render?.(100)).toEqual([
+      "<accent>✦ 2 heads-up",
+      "<error>■ 1 critical",
+      "<warning>■ 1 warning",
+    ]);
+  });
+
+  it("refreshes the open sidebar in place when another note arrives while idle", async () => {
+    const { ui, customCalls, tools, handlers, ctx } = await setup();
+    await addNoteViaTool(tools, "First note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s1"), ctx);
+    expect(customCalls).toHaveLength(1);
+    const open = customCalls[0]!;
+    expect(open.fakeTui.requestRender).not.toHaveBeenCalled(); // opening renders by itself
+
+    await addNoteViaTool(tools, "Second note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s2"), ctx);
+    expect(ui.custom).toHaveBeenCalledOnce(); // no second overlay instance
+    expect(open.fakeTui.requestRender).toHaveBeenCalledOnce(); // refreshed, not reopened
+    expect((open.component.render?.(100) as string[]).join("\n")).toContain("2 heads-up");
+  });
+
+  it("closes the sidebar via its done when the last note is dismissed and opens a fresh overlay for a later note", async () => {
+    const { ui, customCalls, tools, handlers, ctx, handler } = await setupWithPendingNote(
+      {},
+      "Only note",
+      "info",
+    );
+    expect(customCalls).toHaveLength(1);
+    const first = customCalls[0]!;
+
+    expect(handler("0")).toEqual({ consume: true }); // dismiss for the session
+    expect(first.resolve).toHaveBeenCalledTimes(1); // done captured, invoked quiet
+    expect(first.resolve).toHaveBeenCalledWith(undefined);
+
+    await addNoteViaTool(tools, "Fresh note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s2"), ctx);
+    expect(ui.custom).toHaveBeenCalledTimes(2); // a NEW custom instance
+    expect(customCalls[1]!.component).not.toBe(first.component);
+  });
+
+  it("defers the sidebar mid-loop: no custom open and no refresh until agent_end", async () => {
+    const { ui, customCalls, registry, handlers, ctx } = await setup({ config: { reviewEvery: 1 } });
+    handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
+    handlers.get("tool_execution_end")![0](toolEndEvent("a"), ctx);
+    await flush();
+    expect(registry.calls()).toHaveLength(1); // the reviewer still ran mid-loop
+    expect(ui.custom).not.toHaveBeenCalled(); // presentation deferred
+
+    handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
+    expect(ui.custom).toHaveBeenCalledOnce(); // flushed at the loop boundary
+  });
+
+  it("closes an open sidebar exactly once via cleanup on session_shutdown; the next session opens fresh", async () => {
+    const { ui, customCalls, tools, handlers, ctx } = await setup();
+    await addNoteViaTool(tools, "Sticky note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s1"), ctx);
+    expect(customCalls).toHaveLength(1);
+    const first = customCalls[0]!;
+
+    handlers.get("session_shutdown")![0]({ type: "session_shutdown", reason: "quit" }, ctx);
+    expect(first.resolve).toHaveBeenCalledTimes(1); // done-capture cleanup, exactly once
+
+    await handlers.get("session_start")![0]({ type: "session_start", reason: "resume" }, ctx);
+    await addNoteViaTool(tools, "Fresh session note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s2"), ctx);
+    expect(ui.custom).toHaveBeenCalledTimes(2); // state was cleared: a fresh open
+  });
+
+  it("headless mode never opens the sidebar overlay", async () => {
+    const { ui, tools, handlers, ctx } = await setup({ hasUI: false });
+    await addNoteViaTool(tools, "Headless note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s"), ctx);
+    await flush();
+    expect(ui.custom).not.toHaveBeenCalled();
+  });
+
+  it("a stale session's overlay renders nothing and its mouse hook stays inert", async () => {
+    const { customCalls, tools, handlers, ctx } = await setup();
+    await addNoteViaTool(tools, "Guard note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("s1"), ctx);
+    const open = customCalls[0]!;
+
+    handlers.get("session_shutdown")![0]({ type: "session_shutdown", reason: "quit" }, ctx);
+    // pi may still hold the overlay for a frame after disposal: a stale
+    // generation must never repaint session state.
+    expect(open.component.render?.(100)).toEqual([]);
+    // The click-routing surface exists (T3) but stays inert until then.
+    expect(open.component.handleMouse?.({ type: "down" })).toBeUndefined();
   });
 });
