@@ -142,10 +142,64 @@ const flush = async (): Promise<void> => {
 };
 
 const widgetCalls = (ui: { setWidget: any }): any[][] => ui.setWidget.mock.calls;
-const lastWidgetArg = (ui: { setWidget: any }): unknown => widgetCalls(ui).at(-1)?.[1];
+
+/** Fake pi-tui TUI instance handed to a setWidget factory invocation. */
+interface FakeWidgetTui {
+  requestRender: ReturnType<typeof vi.fn>;
+}
+
+/** Stand-in for pi's Theme; output format matches the ctx.ui.theme fake. */
+const fakeTheme = { fg: (token: string, text: string) => `<${token}>${text}` };
+
+/**
+ * Resolve one setWidget mock call's content for BOTH overloads. The string
+ * overload passes through unchanged; the factory overload is invoked with a
+ * fresh fake tui (recorded on the mock call as `fakeTui`) plus the fake
+ * theme, and the returned component is rendered once. Resolution is memoized
+ * on the call so repeated assertions never re-invoke a factory.
+ */
+function resolveWidgetCall(call: any[]): { lines: string[]; tui?: FakeWidgetTui } {
+  const memo = (call as any).resolved as { lines: string[]; tui?: FakeWidgetTui } | undefined;
+  if (memo) return memo;
+  const content = call[1];
+  let resolved: { lines: string[]; tui?: FakeWidgetTui };
+  if (typeof content === "function") {
+    const tui: FakeWidgetTui = { requestRender: vi.fn() };
+    const component = content(tui, fakeTheme) as { render?: (width?: number) => string[] };
+    resolved = { lines: component?.render?.(100) ?? [], tui };
+    (call as any).fakeTui = tui;
+  } else {
+    resolved = { lines: Array.isArray(content) ? content : [], tui: undefined };
+  }
+  (call as any).resolved = resolved;
+  return resolved;
+}
+
+/** Last call's content: raw value for the string overload, resolved lines for factories. */
+const lastWidgetArg = (ui: { setWidget: any }): unknown => {
+  const call = widgetCalls(ui).at(-1);
+  if (!call) return undefined;
+  const content = call[1];
+  if (typeof content === "function") return resolveWidgetCall(call).lines;
+  return content;
+};
+
+/** Fake tui captured by the most recent factory-overload call, if any. */
+const lastWidgetTui = (ui: { setWidget: any }): FakeWidgetTui | undefined => {
+  const calls = widgetCalls(ui);
+  for (let i = calls.length - 1; i >= 0; i--) {
+    if (typeof calls[i]![1] === "function") return resolveWidgetCall(calls[i]!).tui;
+  }
+  return undefined;
+};
+
 const widgetText = (ui: { setWidget: any }): string =>
   widgetCalls(ui)
-    .map((call) => (Array.isArray(call[1]) ? call[1].join("\n") : String(call[1] ?? "")))
+    .map((call) => {
+      const content = call[1];
+      if (typeof content === "function") return resolveWidgetCall(call).lines.join("\n");
+      return Array.isArray(content) ? content.join("\n") : String(content ?? "");
+    })
     .join("\n");
 
 async function addNoteViaTool(tools: Map<string, any>, note: string, severity?: string): Promise<any> {
@@ -460,6 +514,28 @@ describe("you-should-know wiring", () => {
     expect(text).toContain("detail body");
     expect(sent).toHaveLength(0); // never auto-sends
     expect(String(lastWidgetArg(ui))).toContain("Deployment gate is manual"); // note stays pending
+  });
+
+  it("expanded '2' requests a TUI render after filling the editor (stale-screen fix)", async () => {
+    const { ui, handler } = await setupWithPendingNote({}, "Deployment gate is manual\ndetail body", "warning");
+    handler("1"); // expand: the most recent widget write uses the factory overload
+    const tui = lastWidgetTui(ui);
+    expect(tui).toBeDefined(); // a live tui was captured from the factory
+
+    expect(handler("2")).toEqual({ consume: true });
+    expect(ui.setEditorText).toHaveBeenCalledOnce();
+    // setEditorText alone never repaints; the captured tui must be asked to.
+    expect(tui!.requestRender).toHaveBeenCalledOnce();
+  });
+
+  it("headless mode never captures a widget tui: setWidget is never called with a factory", async () => {
+    const { ui, tools, handlers, ctx } = await setup({ hasUI: false });
+    await addNoteViaTool(tools, "Headless note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("ysk-headless"), ctx);
+    await flush();
+    const factories = widgetCalls(ui).filter((call) => typeof call[1] === "function");
+    expect(factories).toHaveLength(0);
+    expect(ui.setWidget).not.toHaveBeenCalled(); // headless semantics unchanged
   });
 
   it("expanded '1' acknowledges non-destructively and collapses back", async () => {

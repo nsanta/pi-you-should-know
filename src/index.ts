@@ -73,6 +73,13 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   // terminal-input unsubscribe handle for the current session.
   let expandedTopic: string | null = null;
   let unsubscribeInput: (() => void) | null = null;
+  // Live TUI captured from the widget factory (last factory invocation wins).
+  // pi hands the factory the interactive TUI when it registers the widget, so
+  // after setEditorText mutates editor state we can request the repaint that
+  // setEditorText itself never schedules. Stays valid for the session even if
+  // the widget is later cleared; null in headless/RPC contexts, where the
+  // factory never runs.
+  let widgetTui: { requestRender: (force?: boolean) => void } | null = null;
 
   // Persistence of permanent dismissals flows through the /ysk ActionDeps
   // (`persist` below), the single write path; no store-level callback.
@@ -106,13 +113,33 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       // silently resets to the collapsed band.
       if (expandedTopic !== null && newest?.topic !== expandedTopic) expandedTopic = null;
       const expanded = newest !== undefined && newest.topic === expandedTopic;
-      const lines =
-        newest === undefined
-          ? undefined
-          : widgetLines(pending, { width: DEFAULT_WIDGET_WIDTH, expanded }).map((row) =>
-              ctx.ui.theme.fg(severityColorToken(row.severity), row.text),
-            );
-      ctx.ui.setWidget(WIDGET_ID, lines, { placement: "aboveEditor" });
+      if (newest === undefined) {
+        // Empty band: clear the widget exactly as before (no factory to invoke).
+        ctx.ui.setWidget(WIDGET_ID, undefined, { placement: "aboveEditor" });
+        return;
+      }
+      // Factory overload: the widget rows are snapshotted per write so frames
+      // redrawn between writes (agent-loop deferral windows) can never leak
+      // newer store state, while theming happens per render inside the
+      // component so theme changes stay correct. pi invokes the factory with
+      // the live TUI, captured above for editor repaints.
+      const rows = widgetLines(pending, { width: DEFAULT_WIDGET_WIDTH, expanded });
+      ctx.ui.setWidget(
+        WIDGET_ID,
+        (tui, theme) => {
+          widgetTui = tui; // plain assignment: capture even if the rest fails
+          try {
+            return {
+              render: () => rows.map((row) => theme.fg(severityColorToken(row.severity), row.text)),
+              invalidate: () => {},
+            };
+          } catch {
+            // quiet: a broken widget factory must never crash the session
+            return { render: () => [], invalidate: () => {} };
+          }
+        },
+        { placement: "aboveEditor" },
+      );
     } catch {
       // widget failures must never crash the session
     }
@@ -387,6 +414,9 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     if (!ctx || !ctx.hasUI) return;
     try {
       ctx.ui.setEditorText(text);
+      // setEditorText only mutates editor state; ask the TUI captured by the
+      // widget factory for the repaint so the note is visible immediately.
+      widgetTui?.requestRender();
     } catch {
       // editor fill is best-effort and must never crash the session
     }
