@@ -14,33 +14,41 @@ and fails quiet by design.
 - The reviewer returns at most 2 notes; notes whose topic was dismissed are dropped
   before they are ever stored.
 - A pending note becomes visible **when the current agent answer completes**
-  (`agent_end`/`agent_settled`) — mid-loop findings stay queued so the band never
-  interrupts work — and renders as a HUD widget above the editor, severity-colored
-  (`info` → accent, `warning` → warning, `critical` → error).
+  (`agent_end`/`agent_settled`) — mid-loop findings stay queued so the sidebar never
+  interrupts work — and are surfaced in a **tally sidebar** docked to the right edge of
+  the terminal (severity-colored, keyboard-focus-free).
 - The agent can also record notes directly through the `heads_up` tool.
 - Reviews are fire-and-forget: a slow or broken reviewer never blocks or breaks the
   session. `session_shutdown` and session replacement abort in-flight reviews.
 
-## Note interaction (keyboard)
+## Note interaction (sidebar + popup)
 
-While a note is displayed above the prompt, single-digit keys act on the **newest**
-note and are consumed (they never reach the editor). Collapsed band:
+While unprocessed notes exist, a compact tally is docked to the **right edge**:
 
 ```
-✦ Heads up · The expiration time a user picks is read in the server's timezone, …
-1: Learn more   2: Knew this already   0: Dismiss
+✦ 3 heads-up
+■ 2 critical
+■ 1 info
 ```
 
-| Key | Effect |
+One row per non-zero severity, priority order (critical > warning > info); the sidebar
+never takes keyboard focus.
+
+- **Click a severity row** (or the header for all notes) to open the popup. With one
+  matching note it opens the detail directly; with several it shows a numbered list
+  first (newest first), then the detail.
+- **Or run `/ysk`** to open the same popup over all pending notes; `/ysk learn [n]`
+  targets a specific note.
+- Popup detail actions (keys or clicking the action rows):
+
+| Action | Effect |
 | --- | --- |
-| `1` | Expand the full explanation **in place** (same band): title, detail lines, and `1: Understood  2: Chat in main session  0: Dismiss`. |
-| `1` (expanded) | Understood — collapse back to the summary band; the note stays pending. |
-| `2` (expanded) | Fill the prompt editor with the composed explanation — you review/edit and press Enter yourself; nothing is sent automatically. |
-| `2` (collapsed) | "Knew this already": dismiss the topic permanently (persisted). |
-| `0` | Dismiss the note for this session only. |
+| `1: Understood` | Marks the note **processed** — it leaves the sidebar for this session. |
+| `2: Chat in main session` | Fills the prompt editor with the composed explanation (review, then press Enter yourself) and marks the note processed. |
+| `0: Dismiss` | Hides the note for this session. |
 
-Keys work only in TUI mode with a pending note; typed digits pass through untouched
-when no note is displayed or when input is multi-character (paste-safe).
+`Esc` closes the popup without processing anything. Mouse clicks require a
+fullscreen/alt-screen terminal (pi enables mouse there); in plain terminals use `/ysk`.
 
 ## Install
 
@@ -92,10 +100,11 @@ The `/ysk` command set stays as a fallback (discovery, scripting, older notes):
 
 | Command | Effect |
 | --- | --- |
-| `/ysk` or `/ysk status` | Multi-line status: cadence, steps since last review, in-flight flag, pending count, dismissed count. |
-| `/ysk learn [n]` | Expand the note **in place** in the widget band (same state as key `1`). |
+| `/ysk` | Open the popup over all pending notes (list stage when several, newest otherwise). |
+| `/ysk status` | Multi-line status: cadence, steps since last review, in-flight flag, pending count, dismissed count. |
+| `/ysk learn [n]` | Open the popup for a specific note (1-based, oldest = 1). |
 | `/ysk known [n]` | "Knew this already": dismiss the topic **permanently** (persisted); the reviewer will skip it from now on. |
-| `/ysk chat [n]` | Fill the prompt editor with the composed note ("Re: heads-up — please address"); you review and send it yourself. |
+| `/ysk chat [n]` | Fill the prompt editor with the composed note and mark it processed; you review and send it yourself. |
 | `/ysk dismiss [n]` | Hide the note for **this session only** (not persisted). |
 
 Notes are addressed newest-first by default; `n` is a 1-based index in the widget's
