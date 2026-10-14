@@ -1,6 +1,6 @@
 # Feature: ysk-inline-actions (keyboard-driven note interaction)
 
-Status: in_progress
+Status: completed
 Branch: feature/you-should-know (continues after ca2ab84; ESC fix is the first work unit)
 Created: 2026-02-18
 Engram mirror: engram observation 4237, project pi-you-should-know (auto-detected via git root), topic ysk-inline-actions/tasks.
@@ -85,6 +85,11 @@ README interaction section (keys, /ysk parity, timing); full suite + typecheck;
 gentle-ai-verify delegation; native review candidate = accumulated feature work unit(s).
 Acceptance: verify PASS or documented follow-ups; review approved or correction handled.
 
+## Residual (post-close, by decision)
+- 4 advisory review suggestions above = future hardening work (deferred-band key capture is the most user-visible: digits act on a queued-but-unseen band mid-loop).
+- No real-TUI manual smoke test yet: run `pi --extension /home/nicolas/projects/pi-you-should-know/src/index.ts`, trigger a note, press 1/2/0.
+- Push / PR / merge to main = user decision; branch left local.
+
 ## Evidence
 
 | Task | Commit | Result |
@@ -94,3 +99,4 @@ Acceptance: verify PASS or documented follow-ups; review approved or correction 
 | T3 overlay removal + remap | 903ff89 | 137/137 green, tsc clean; no ui.custom/matchesKey/pi-tui refs in src; /ysk learn expands in place, /ysk chat fills editor; unused pi-tui dep removed |
 | T4 answer-completion gating | 6044e26 | 141/141 green, tsc clean; mid-loop renders deferred (dirty flag), agent_end/agent_settled flush; boundary decision corrected from literal turn_end to agent_end (turn_end fires mid-task) |
 | T5 docs + verify | 143d8d3 | README keys/timing/parity documented; gentle-ai-verify PASS at 143d8d3: 141/141, tsc clean, installed-API cross-check clean, no wedge/double-render/leak; 2 non-blocking notes (mid-loop key capture on deferred band; fixed width 100) |
+| Native review | lineage review-4bb939e26ab2f599, target sha256:b8475b41…, base 93a175b (committed range 2d62f78..HEAD) | APPROVED (reliability lens); authority burned, burn evidence gentle-ai.review-acknowledged/v1. 4 advisory SUGGESTIONS (non-blocking): deferred-band key capture (index.ts:259), expanded hint label derivation (widget.ts:64), fillEditor mode guard (index.ts:399), multibyte key gap (index.ts:263). |
