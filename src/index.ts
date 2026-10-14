@@ -416,6 +416,9 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       ctx.ui.setEditorText(text);
       // setEditorText only mutates editor state; ask the TUI captured by the
       // widget factory for the repaint so the note is visible immediately.
+      // Upstream gap tracked in earendil-works/pi#5620 (setEditorText does
+      // not re-render outside the input loop); if that fix lands, the
+      // requestRender here becomes redundant but harmless.
       widgetTui?.requestRender();
     } catch {
       // editor fill is best-effort and must never crash the session
