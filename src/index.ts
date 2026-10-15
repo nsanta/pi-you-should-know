@@ -47,7 +47,6 @@ import {
   severityColorToken,
   sidebarCardRows,
   type CardRow,
-  type WidgetLine,
 } from "./widget.ts";
 
 const USER_CONFIG_PATH = "~/.pi/agent/you-should-know.json";
@@ -57,10 +56,12 @@ const USER_CONFIG_PATH = "~/.pi/agent/you-should-know.json";
  * terminal width and every frame renders at the width pi-tui hands it.
  */
 const SIDEBAR_FALLBACK_WIDTH = 26;
-/** Popup rows truncate to the overlay's 60% width, never below this. */
+/**
+ * Fallback row width for popup frames rendered without a width (tests, odd
+ * terminals) — not the overlay size: the popup overlay spans 80% of the
+ * terminal and every frame renders at the width pi-tui hands it.
+ */
 const POPUP_WIDTH_MIN = 40;
-/** Popup overlay width as a fraction of the terminal width. */
-const POPUP_WIDTH_RATIO = 0.6;
 
 /**
  * The streamSimple adapter surface, derived structurally from the installed
@@ -302,13 +303,17 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     }
   }
 
-  /** Row width for popup renders: the overlay's 60% width, never below 40. */
+  /**
+   * Row width for popup frames: render receives the overlay's resolved
+   * width from pi-tui (the "80%" overlay option resolved against the
+   * terminal, clamped to the margins), so no re-ratio is applied here.
+   * Finite widths floor to at least 1; anything else falls back to
+   * POPUP_WIDTH_MIN (tests, odd terminals).
+   */
   function popupRowWidth(viewportWidth: number | undefined): number {
-    const usable =
-      typeof viewportWidth === "number" && Number.isFinite(viewportWidth)
-        ? Math.floor(viewportWidth * POPUP_WIDTH_RATIO)
-        : POPUP_WIDTH_MIN;
-    return Math.max(POPUP_WIDTH_MIN, usable);
+    return typeof viewportWidth === "number" && Number.isFinite(viewportWidth)
+      ? Math.max(1, Math.floor(viewportWidth))
+      : POPUP_WIDTH_MIN;
   }
 
   /**
@@ -324,7 +329,9 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   }
 
   /**
-   * Open the note popup as a capturing centered overlay. TUI-only: headless
+   * Open the note popup as a capturing centered overlay (width and
+   * maxHeight 80%; pi-tui resolves the percentage and hands the resolved
+   * width to every render). TUI-only: headless
    * and RPC contexts never open anything. One popup at a time — an open
    * popup is closed through its captured done first. Target notes: { all }
    * or { severity } filter the pending store, a single Note targets itself.
@@ -349,10 +356,10 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     if (notes.length === 0) return;
     let stage: PopupStage =
       notes.length > 1 ? { kind: "list", notes } : { kind: "detail", note: notes[0]! };
-    let popupRows: WidgetLine[] = []; // rows of the most recent frame, for mouse hit-testing
+    let popupRows: CardRow[] = []; // rows of the most recent frame, for mouse hit-testing
 
-    /** Rows of the current stage at the given width (render's single source). */
-    const currentRows = (width: number | undefined): WidgetLine[] =>
+    /** Framed rows of the current stage at the given width (render's single source). */
+    const currentRows = (width: number | undefined): CardRow[] =>
       stage.kind === "list"
         ? popupListRows(stage.notes, { width: popupRowWidth(width) })
         : popupDetailRows(stage.note, { width: popupRowWidth(width) });
@@ -367,7 +374,11 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
             if (gen !== generation) return []; // stale generation renders nothing
             // Frames redraw constantly: recompute rows from the snapshot stage.
             popupRows = currentRows(width);
-            return popupRows.map((row) => theme.fg(severityColorToken(row.severity), row.text));
+            // Same segment mapping as the sidebar render: the framer owns the
+            // frame, each segment carries the token to theme it with.
+            return popupRows.map((row) =>
+              row.segments.map((segment) => theme.fg(severityColorToken(segment.token), segment.text)).join(""),
+            );
           },
           handleInput: (data: string) => {
             if (gen !== generation) return;
@@ -437,8 +448,8 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
         overlay: true,
         overlayOptions: {
           anchor: "center",
-          width: "60%",
-          maxHeight: "60%",
+          width: "80%",
+          maxHeight: "80%",
           margin: 1,
         },
         onHandle: (handle) => {

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   POPUP_ACTIONS,
+  type CardRow,
+  frameCardRows,
   noteIndexAtPopupRow,
   popupActionAtRow,
   popupDetailRows,
@@ -11,11 +13,22 @@ import {
   sidebarCardRows,
   tallyBySeverity,
   truncateLine,
+  wrapLine,
 } from "../src/widget.ts";
 import type { Note } from "../src/notes.ts";
 
 function note(overrides: Partial<Note> = {}): Note {
   return { topic: "topic", severity: "info", title: "A title", detail: "Some detail", ...overrides };
+}
+
+/** Full row text: every segment joined (frame runs included). */
+function rowText(row: CardRow): string {
+  return row.segments.map((segment) => segment.text).join("");
+}
+
+/** Body text of a framed card row: the middle segments joined (frame runs dropped). */
+function rowBody(row: CardRow): string {
+  return row.segments.slice(1, -1).map((segment) => segment.text).join("");
 }
 
 describe("severity mappings", () => {
@@ -72,15 +85,14 @@ describe("POPUP_ACTIONS", () => {
     ]);
   });
 
-  it("drives the popupDetailRows hint block (one row per action)", () => {
-    const rows = popupDetailRows(note({ detail: "   " }));
-    const tail = rows.slice(-POPUP_ACTIONS.length).map((row) => row.text);
-    expect(tail).toEqual(POPUP_ACTIONS.map((entry) => `${entry.key}: ${entry.label}`));
-    expect(rows.slice(0, rows.length - POPUP_ACTIONS.length)).toEqual([
-      { severity: "info", text: "Heads up · A title" },
-      { severity: "info", text: "" },
-      { severity: "info", text: "" },
-    ]);
+  it("drives the popupDetailRows hint block (one muted row per action, just above the bottom rule)", () => {
+    const rows = popupDetailRows(note({ detail: "   " }), { width: 40 });
+    const tail = rows.slice(-POPUP_ACTIONS.length - 1); // 3 hint rows + bottom rule
+    expect(tail.map(rowBody)).toEqual([...POPUP_ACTIONS.map((entry) => `${entry.key}: ${entry.label}`), ""]);
+    for (const hintRow of tail.slice(0, -1)) {
+      expect(hintRow.segments[1]).toMatchObject({ token: "muted" });
+    }
+    expect(rowText(tail.at(-1)!)).toBe(`╰${"─".repeat(38)}╯`); // the bottom rule closes the card
   });
 });
 
@@ -272,104 +284,387 @@ describe("severityAtSidebarCardRow", () => {
   });
 });
 
-describe("popupListRows", () => {
-  it("builds a muted header, 1-based numbered rows, and a muted hint", () => {
-    const rows = popupListRows([note({ title: "First" }), note({ severity: "critical", title: "Second" })]);
-    expect(rows).toEqual([
-      { severity: "muted", text: "Heads up" },
-      { severity: "info", text: "1. [info] First" },
-      { severity: "critical", text: "2. [critical] Second" },
-      { severity: "muted", text: "number to open · Esc to close" },
+describe("frameCardRows", () => {
+  it("frames a title and body rows at exactly the requested width (26)", () => {
+    expect(
+      frameCardRows(
+        [
+          { severity: "critical", text: "■ 2 critical" },
+          { severity: "muted", text: "hint" },
+        ],
+        "✦ 2 heads-up",
+        { width: 26 },
+      ),
+    ).toEqual([
+      {
+        segments: [
+          { token: "border", text: "╭─ " },
+          { token: "info", text: "✦ 2 heads-up" },
+          { token: "border", text: ` ${"─".repeat(9)}╮` }, // fill = 26 - 12 - 5
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "critical", text: "■ 2 critical" },
+          { token: "border", text: `${" ".repeat(10)} │` }, // pad = 26 - 4 - 12
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "muted", text: "hint" },
+          { token: "border", text: `${" ".repeat(18)} │` }, // pad = 26 - 4 - 4
+        ],
+      },
+      { segments: [{ token: "border", text: `╰${"─".repeat(24)}╯` }] },
     ]);
   });
 
-  it("returns [] when there are no notes", () => {
+  it("keeps each body row's own token and truncates over-long text to the inner width", () => {
+    const rows = frameCardRows([{ severity: "warning", text: "w".repeat(30) }], "t".repeat(40), { width: 20 });
+    expect(rows[0]!.segments[1]).toEqual({ token: "info", text: `${"t".repeat(14)}…` }); // title bound: 20 - 5
+    expect(rows[1]!.segments[1]).toEqual({ token: "warning", text: `${"w".repeat(15)}…` }); // body bound: 20 - 4
+    for (const row of rows) expect(rowText(row)).toHaveLength(20);
+  });
+
+  it("degrades to bare clamped rules below width 5 (the sidebar's narrow branches)", () => {
+    expect(frameCardRows([{ severity: "info", text: "body" }], "title", { width: 4 })).toEqual([
+      { segments: [{ token: "border", text: "╭──╮" }] },
+      { segments: [{ token: "border", text: "╰──╯" }] },
+    ]);
+    expect(frameCardRows([], "title", { width: 1 })).toEqual([
+      { segments: [{ token: "border", text: "╭" }] },
+      { segments: [{ token: "border", text: "╰" }] },
+    ]);
+    // Non-finite widths clamp to 0 before the degenerate branch runs.
+    expect(frameCardRows([], "title", { width: Number.NaN })).toEqual(frameCardRows([], "title", { width: 0 }));
+  });
+
+  it("is byte-identical to sidebarCardRows output when given the sidebar's rows and title", () => {
+    const notes = [note({ severity: "critical" }), note(), note({ severity: "warning" })];
+    expect(sidebarCardRows(notes, { width: 26 })).toEqual(
+      frameCardRows(
+        [
+          { severity: "critical", text: "■ 1 critical" },
+          { severity: "warning", text: "■ 1 warning" },
+          { severity: "info", text: "■ 1 info" },
+        ],
+        "✦ 3 heads-up",
+        { width: 26 },
+      ),
+    );
+  });
+});
+
+describe("wrapLine", () => {
+  it("keeps short text on a single row", () => {
+    expect(wrapLine("already short", 40)).toEqual(["already short"]);
+  });
+
+  it("packs as many whole words per row as the width allows", () => {
+    expect(wrapLine("aaa bb cc", 7)).toEqual(["aaa bb", "cc"]); // "aaa bb cc" is 9 chars
+  });
+
+  it("hard-breaks a single word longer than the width: nothing lost, no ellipsis", () => {
+    const rows = wrapLine("x".repeat(60), 20);
+    expect(rows).toEqual(["x".repeat(20), "x".repeat(20), "x".repeat(20)]); // exactly 3 rows
+    expect(rows.join("")).toBe("x".repeat(60)); // concatenation recovers the full text
+    expect(rows.join("")).not.toContain("…");
+  });
+
+  it("hard-breaks an over-long word mid-text and continues with the next word", () => {
+    expect(wrapLine("aaaa b", 3)).toEqual(["aaa", "a b"]);
+  });
+
+  it('returns [""] for empty text', () => {
+    expect(wrapLine("", 20)).toEqual([""]);
+  });
+
+  it("degenerates to 1-char rows below width 2 (including invalid widths)", () => {
+    expect(wrapLine("abc", 1)).toEqual(["a", "b", "c"]);
+    expect(wrapLine("abc", 0)).toEqual(["a", "b", "c"]);
+    expect(wrapLine("ab", Number.NaN)).toEqual(["a", "b"]);
+  });
+
+  it("collapses space runs and trims the ends", () => {
+    expect(wrapLine("  a  b  ", 10)).toEqual(["a b"]);
+  });
+
+  it("fits a word exactly as wide as the bound", () => {
+    expect(wrapLine("abc", 3)).toEqual(["abc"]);
+  });
+});
+
+describe("popupListRows", () => {
+  it("frames the numbered note rows and the hint inside a full card (width 40)", () => {
+    const rows = popupListRows(
+      [note({ title: "First" }), note({ severity: "critical", title: "Second" })],
+      { width: 40 },
+    );
+    expect(rows).toEqual([
+      {
+        segments: [
+          { token: "border", text: "╭─ " },
+          { token: "info", text: "✦ Heads up" },
+          { token: "border", text: ` ${"─".repeat(25)}╮` }, // fill = 40 - 10 - 5
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "info", text: "1. [info] First" },
+          { token: "border", text: `${" ".repeat(21)} │` }, // pad = 40 - 4 - 15
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "critical", text: "2. [critical] Second" },
+          { token: "border", text: `${" ".repeat(16)} │` }, // pad = 40 - 4 - 20
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "muted", text: "number to open · Esc to close" },
+          { token: "border", text: `${" ".repeat(7)} │` }, // pad = 40 - 4 - 29
+        ],
+      },
+      { segments: [{ token: "border", text: `╰${"─".repeat(38)}╯` }] },
+    ]);
+    for (const row of rows) expect(rowText(row)).toHaveLength(40);
+  });
+
+  it("returns [] for empty or unusable notes, and for an unusable width", () => {
     expect(popupListRows([])).toEqual([]);
+    expect(popupListRows(undefined as unknown as Note[], { width: 40 })).toEqual([]);
+    expect(popupListRows("notes" as unknown as Note[], { width: 40 })).toEqual([]);
+    expect(popupListRows([note()], { width: Number.NaN })).toEqual([]);
+    expect(popupListRows([note()])).toEqual([]); // width is required in practice: none -> []
+  });
+
+  it("wraps long entries instead of truncating: continuation rows keep the severity, full text visible", () => {
+    const rows = popupListRows(
+      [note({ severity: "warning", title: "Silent assumption caught mid refactor" })],
+      { width: 26 },
+    );
+    // "1. [warning] Silent assumption caught mid refactor" wraps at the 22-col inner width.
+    expect(rows.map(rowBody)).toEqual([
+      "✦ Heads up",
+      "1. [warning] Silent",
+      "assumption caught mid",
+      "refactor",
+      "number to open · Esc", // the hint wraps too: no ellipsis anywhere
+      "to close",
+      "",
+    ]);
+    expect(rows[2]!.segments[1]).toEqual({ token: "warning", text: "assumption caught mid" }); // same severity, no prefix
+    expect(rows.map(rowText).join("\n")).not.toContain("…");
+    for (const row of rows) expect(rowText(row)).toHaveLength(26);
   });
 
   it("falls back to the topic when the title is blank", () => {
-    const rows = popupListRows([note({ title: "   ", topic: "silent assumption" })]);
-    expect(rows[1]!.text).toBe("1. [info] silent assumption");
+    const rows = popupListRows([note({ title: "   ", topic: "silent assumption" })], { width: 40 });
+    expect(rowBody(rows[1]!)).toBe("1. [info] silent assumption");
   });
 
-  it("truncates rows at the requested width", () => {
-    const rows = popupListRows([note({ title: "x".repeat(60) })], { width: 14 });
-    for (const row of rows) expect(row.text.length).toBeLessThanOrEqual(14);
-    expect(rows[1]!.text).toBe("1. [info] xxx…");
+  it("floors non-integer widths before framing", () => {
+    const rows = popupListRows([note()], { width: 40.9 });
+    for (const row of rows) expect(rowText(row)).toHaveLength(40);
   });
 });
 
 describe("noteIndexAtPopupRow", () => {
-  const rows = popupListRows([note(), note({ title: "B" })]);
+  const rows = popupListRows([note(), note({ title: "B" })], { width: 40 });
+  // Framed layout: 0 top rule, 1 "1. ...", 2 "2. ...", 3 hint, 4 bottom rule.
 
-  it("maps numbered rows to their 1-based note index", () => {
+  it("maps numbered body rows to their 1-based note index", () => {
     expect(noteIndexAtPopupRow(rows, 1)).toBe(1);
     expect(noteIndexAtPopupRow(rows, 2)).toBe(2);
   });
 
-  it("returns null for the header, the hint, and out-of-range rows", () => {
+  it("returns null for the top rule, the hint, the bottom rule, and out-of-range rows", () => {
     expect(noteIndexAtPopupRow(rows, 0)).toBeNull();
     expect(noteIndexAtPopupRow(rows, 3)).toBeNull();
+    expect(noteIndexAtPopupRow(rows, 4)).toBeNull();
     expect(noteIndexAtPopupRow(rows, -1)).toBeNull();
     expect(noteIndexAtPopupRow(rows, 99)).toBeNull();
+    expect(noteIndexAtPopupRow(rows, 1.5)).toBeNull();
     expect(noteIndexAtPopupRow([], 0)).toBeNull();
+  });
+
+  it("returns null on wrapped continuation rows", () => {
+    const wrapped = popupListRows(
+      [note({ severity: "warning", title: "Silent assumption caught mid refactor" })],
+      { width: 26 },
+    );
+    expect(noteIndexAtPopupRow(wrapped, 1)).toBe(1); // "1. [warning] Silent"
+    expect(noteIndexAtPopupRow(wrapped, 2)).toBeNull(); // "assumption caught mid"
+    expect(noteIndexAtPopupRow(wrapped, 3)).toBeNull(); // "refactor"
   });
 });
 
 describe("popupDetailRows", () => {
-  it("shows the severity header, blank, detail lines, blank, and the muted hint block", () => {
+  it("frames the severity title, blank, detail lines, blank, and the muted hint block (width 40)", () => {
     const rows = popupDetailRows(
       note({ severity: "warning", title: "Silent assumption", detail: "line one\nline two" }),
+      { width: 40 },
     );
     expect(rows).toEqual([
-      { severity: "warning", text: "Heads up · Silent assumption" },
-      { severity: "info", text: "" },
-      { severity: "info", text: "line one" },
-      { severity: "info", text: "line two" },
-      { severity: "info", text: "" },
-      { severity: "muted", text: "1: Understood" },
-      { severity: "muted", text: "2: Chat in main session" },
-      { severity: "muted", text: "0: Dismiss" },
+      {
+        segments: [
+          { token: "border", text: "╭─ " },
+          { token: "info", text: "✦ Heads up" },
+          { token: "border", text: ` ${"─".repeat(25)}╮` }, // fill = 40 - 10 - 5
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "warning", text: "Silent assumption" },
+          { token: "border", text: `${" ".repeat(19)} │` }, // pad = 40 - 4 - 17
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "info", text: "" },
+          { token: "border", text: `${" ".repeat(36)} │` }, // pad = 40 - 4 - 0
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "info", text: "line one" },
+          { token: "border", text: `${" ".repeat(28)} │` }, // pad = 40 - 4 - 8
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "info", text: "line two" },
+          { token: "border", text: `${" ".repeat(28)} │` },
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "info", text: "" },
+          { token: "border", text: `${" ".repeat(36)} │` },
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "muted", text: "1: Understood" },
+          { token: "border", text: `${" ".repeat(23)} │` }, // pad = 40 - 4 - 13
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "muted", text: "2: Chat in main session" },
+          { token: "border", text: `${" ".repeat(13)} │` }, // pad = 40 - 4 - 23
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "muted", text: "0: Dismiss" },
+          { token: "border", text: `${" ".repeat(26)} │` }, // pad = 40 - 4 - 10
+        ],
+      },
+      { segments: [{ token: "border", text: `╰${"─".repeat(38)}╯` }] },
     ]);
+    for (const row of rows) expect(rowText(row)).toHaveLength(40);
   });
 
   it("omits detail rows when the detail is blank but keeps the surrounding blanks and hint block", () => {
-    const rows = popupDetailRows(note({ detail: "   " }));
-    expect(rows).toEqual([
-      { severity: "info", text: "Heads up · A title" },
-      { severity: "info", text: "" },
-      { severity: "info", text: "" },
-      { severity: "muted", text: "1: Understood" },
-      { severity: "muted", text: "2: Chat in main session" },
-      { severity: "muted", text: "0: Dismiss" },
+    const rows = popupDetailRows(note({ detail: "   " }), { width: 40 });
+    expect(rows.map(rowBody)).toEqual([
+      "✦ Heads up",
+      "A title",
+      "",
+      "",
+      "1: Understood",
+      "2: Chat in main session",
+      "0: Dismiss",
+      "",
     ]);
   });
 
   it("falls back to the topic when the title is blank", () => {
-    expect(popupDetailRows(note({ title: "  ", topic: "t" }))[0]!.text).toBe("Heads up · t");
+    const rows = popupDetailRows(note({ title: "  ", topic: "t" }), { width: 40 });
+    expect(rowBody(rows[1]!)).toBe("t");
   });
 
-  it("truncates every row at the requested width", () => {
-    const rows = popupDetailRows(note({ detail: "d".repeat(60) }), { width: 16 });
-    for (const row of rows) expect(row.text.length).toBeLessThanOrEqual(16);
+  it("returns [] for null/non-object notes or an unframeable width", () => {
+    expect(popupDetailRows(null as unknown as Note, { width: 40 })).toEqual([]);
+    expect(popupDetailRows("note" as unknown as Note, { width: 40 })).toEqual([]);
+    expect(popupDetailRows(note(), { width: 4 })).toEqual([]);
+  });
+
+  it("keeps blank lines inside a multi-line detail (paragraph structure)", () => {
+    const rows = popupDetailRows(note({ detail: "a\n\nb" }), { width: 40 });
+    expect(rows.map(rowBody).slice(3, 6)).toEqual(["a", "", "b"]);
+  });
+
+  it("wraps long titles and details instead of truncating; the full brief stays visible", () => {
+    const rows = popupDetailRows(
+      note({
+        severity: "critical",
+        title: "Hidden decision shipped silently",
+        detail: "The gate was skipped\nThe gate was skipped",
+      }),
+      { width: 26 },
+    );
+    expect(rows.map(rowBody)).toEqual([
+      "✦ Heads up",
+      "Hidden decision", // the severity title wraps at the 22-col inner width...
+      "shipped silently", // ...and the continuation keeps the severity token
+      "",
+      "The gate was skipped",
+      "The gate was skipped",
+      "",
+      "1: Understood",
+      "2: Chat in main", // even a long hint row wraps rather than truncating
+      "session",
+      "0: Dismiss",
+      "",
+    ]);
+    expect(rows[2]!.segments[1]).toEqual({ token: "critical", text: "shipped silently" });
+    expect(rows.map(rowText).join("\n")).not.toContain("…");
+    for (const row of rows) expect(rowText(row)).toHaveLength(26);
+  });
+
+  it("hard-breaks a single over-long detail word across rows, still recovering the full text", () => {
+    const rows = popupDetailRows(note({ detail: "x".repeat(60) }), { width: 24 });
+    const detailRows = rows.map(rowBody).filter((text) => text.includes("x"));
+    expect(detailRows).toEqual(["x".repeat(20), "x".repeat(20), "x".repeat(20)]); // inner width 24 - 4
+    expect(detailRows.join("")).toBe("x".repeat(60));
   });
 });
 
 describe("popupActionAtRow", () => {
-  const rows = popupDetailRows(note()); // header, blank, detail, blank, 3 hint rows
+  const rows = popupDetailRows(note(), { width: 40 });
+  // Framed layout: 0 top, 1 title, 2 blank, 3 detail, 4 blank, 5-7 hints, 8 bottom rule.
+  const start = rows.length - 1 - POPUP_ACTIONS.length; // first actionable row, just above the bottom rule
 
-  it("maps each trailing hint row to the action it names", () => {
-    const hintAt = (text: string) => rows.findIndex((row) => row.text === text);
-    expect(popupActionAtRow(rows, hintAt("1: Understood"))).toBe("understood");
-    expect(popupActionAtRow(rows, hintAt("2: Chat in main session"))).toBe("chat");
-    expect(popupActionAtRow(rows, hintAt("0: Dismiss"))).toBe("dismiss");
+  it("maps each hint row above the bottom rule to the action it names", () => {
+    expect(start).toBe(5);
+    expect(popupActionAtRow(rows, start)).toBe("understood"); // "1: Understood"
+    expect(popupActionAtRow(rows, start + 1)).toBe("chat"); // "2: Chat in main session"
+    expect(popupActionAtRow(rows, start + 2)).toBe("dismiss"); // "0: Dismiss"
   });
 
-  it("returns null for header, blank, and detail rows, and out-of-range indices", () => {
-    expect(popupActionAtRow(rows, 0)).toBeNull(); // header
-    expect(popupActionAtRow(rows, 1)).toBeNull(); // blank
-    expect(popupActionAtRow(rows, 2)).toBeNull(); // detail line
-    expect(popupActionAtRow(rows, 3)).toBeNull(); // blank before the hint block
+  it("returns null for the bottom rule, the body above the hint block, and out-of-range rows", () => {
+    expect(popupActionAtRow(rows, rows.length - 1)).toBeNull(); // the bottom rule itself
+    expect(popupActionAtRow(rows, 0)).toBeNull(); // top rule
+    expect(popupActionAtRow(rows, 1)).toBeNull(); // title row
+    expect(popupActionAtRow(rows, 2)).toBeNull(); // blank
+    expect(popupActionAtRow(rows, 3)).toBeNull(); // detail line
+    expect(popupActionAtRow(rows, 4)).toBeNull(); // blank before the hint block
     expect(popupActionAtRow(rows, -1)).toBeNull();
     expect(popupActionAtRow(rows, rows.length)).toBeNull();
     expect(popupActionAtRow(rows, 1.5)).toBeNull();
@@ -377,10 +672,10 @@ describe("popupActionAtRow", () => {
   });
 
   it("never treats a detail line as an action, even one starting '<digit>: '", () => {
-    const tricky = popupDetailRows(note({ detail: "2: Chat looks like a hint line" }));
-    const detailAt = tricky.findIndex((row) => row.text === "2: Chat looks like a hint line");
+    const tricky = popupDetailRows(note({ detail: "2: Chat looks like a hint line" }), { width: 40 });
+    const detailAt = tricky.map(rowBody).indexOf("2: Chat looks like a hint line");
     expect(detailAt).toBeGreaterThan(0);
-    expect(detailAt).toBeLessThan(tricky.length - POPUP_ACTIONS.length); // outside the trailing block
+    expect(detailAt).toBeLessThan(tricky.length - 1 - POPUP_ACTIONS.length); // outside the actionable block
     expect(popupActionAtRow(tricky, detailAt)).toBeNull();
   });
 });

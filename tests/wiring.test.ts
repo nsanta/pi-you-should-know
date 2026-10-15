@@ -374,7 +374,8 @@ describe("you-should-know wiring", () => {
 
     await commands.get("ysk").handler("learn", ctx); // newest by default
     expect(ui.custom).toHaveBeenCalledTimes(2);
-    expect(renderOf(customCalls[1]!)).toContain("Heads up · Some assumption");
+    expect(renderOf(customCalls[1]!)).toContain("✦ Heads up"); // the framed card title
+    expect(renderOf(customCalls[1]!)).toContain("Some assumption"); // the severity title row
 
     // learn <n> targets the 1-based note, not just the newest.
     const two = await setup();
@@ -382,7 +383,7 @@ describe("you-should-know wiring", () => {
     await addNoteViaTool(two.tools, "Newest note");
     two.handlers.get("tool_execution_end")![0](toolEndEvent("ysk-older"), two.ctx);
     await two.commands.get("ysk").handler("learn 1", two.ctx);
-    expect(renderOf(two.customCalls[1]!)).toContain("Heads up · Older note");
+    expect(renderOf(two.customCalls[1]!)).toContain("Older note");
 
     // /ysk status only reports: it never opens a popup.
     const opensBefore = ui.custom.mock.calls.length;
@@ -701,27 +702,38 @@ describe("you-should-know tally sidebar overlay", () => {
 // --- note popup (T3) -----------------------------------------------------------
 
 describe("you-should-know note popup", () => {
-  it("bare /ysk opens a centered capturing popup: list rows for 2+ pending, detail rows for exactly 1", async () => {
+  it("bare /ysk opens a centered capturing popup: framed list rows for 2+ pending, detail rows for exactly 1", async () => {
     const { ui, popup } = await setupWithPopup(["Silent assumption", "Hidden decision"], ["warning", "critical"]);
     expect(ui.custom).toHaveBeenCalledTimes(2); // sidebar + popup
     expect(popup.opts?.overlay).toBe(true);
-    expect(popup.opts?.overlayOptions).toEqual({ anchor: "center", width: "60%", maxHeight: "60%", margin: 1 });
+    expect(popup.opts?.overlayOptions).toEqual({ anchor: "center", width: "80%", maxHeight: "80%", margin: 1 });
+    // render(100): the overlay's resolved width is 100 cols. Card title
+    // "✦ Heads up" is 10 chars -> top-rule fill = 100 - 10 - 5 = 85 dashes;
+    // each body row pads to 100 - 4 - <text length> spaces.
     expect(popup.component.render?.(100)).toEqual([
-      "<muted>Heads up",
-      "<error>1. [critical] Hidden decision",
-      "<warning>2. [warning] Silent assumption",
-      "<muted>number to open · Esc to close",
+      `<border>╭─ <accent>✦ Heads up<border> ${"─".repeat(85)}╮`,
+      // "1. [critical] Hidden decision" = 29 chars -> pad = 100 - 4 - 29 = 67
+      `<border>│ <error>1. [critical] Hidden decision<border>${" ".repeat(67)} │`,
+      // "2. [warning] Silent assumption" = 30 chars -> pad = 100 - 4 - 30 = 66
+      `<border>│ <warning>2. [warning] Silent assumption<border>${" ".repeat(66)} │`,
+      // hint = 29 chars -> pad = 100 - 4 - 29 = 67
+      `<border>│ <muted>number to open · Esc to close<border>${" ".repeat(67)} │`,
+      `<border>╰${"─".repeat(98)}╯`,
     ]);
 
     const single = await setupWithPopup(["Only note"]);
     expect(single.popup.component.render?.(100)).toEqual([
-      "<accent>Heads up · Only note",
-      "<accent>",
-      "<accent>Only note",
-      "<accent>",
-      "<muted>1: Understood",
-      "<muted>2: Chat in main session",
-      "<muted>0: Dismiss",
+      `<border>╭─ <accent>✦ Heads up<border> ${"─".repeat(85)}╮`,
+      // title row "Only note" = 9 chars -> pad = 100 - 4 - 9 = 87; info severity -> accent
+      `<border>│ <accent>Only note<border>${" ".repeat(87)} │`,
+      `<border>│ <accent><border>${" ".repeat(96)} │`, // blank row: pad = 100 - 4 - 0
+      `<border>│ <accent>Only note<border>${" ".repeat(87)} │`, // detail = the full note text
+      `<border>│ <accent><border>${" ".repeat(96)} │`,
+      // "1: Understood" = 13 -> pad 83; "2: Chat in main session" = 23 -> 73; "0: Dismiss" = 10 -> 86
+      `<border>│ <muted>1: Understood<border>${" ".repeat(83)} │`,
+      `<border>│ <muted>2: Chat in main session<border>${" ".repeat(73)} │`,
+      `<border>│ <muted>0: Dismiss<border>${" ".repeat(86)} │`,
+      `<border>╰${"─".repeat(98)}╯`,
     ]);
   });
 
@@ -729,7 +741,8 @@ describe("you-should-know note popup", () => {
     const { popup } = await setupWithPopup(["First note", "Second note"]);
     popup.component.handleInput!("1");
     const rows = popup.component.render?.(100) ?? [];
-    expect(rows.join("\n")).toContain("Heads up · Second note"); // newest first
+    expect(rows.join("\n")).toContain("✦ Heads up"); // framed card title
+    expect(rows.join("\n")).toContain("Second note"); // newest first: the body title row
     expect(rows.join("\n")).not.toContain("number to open");
   });
 
@@ -785,28 +798,50 @@ describe("you-should-know note popup", () => {
     expect(renderOf(first.sidebar)).toContain("1 head-up");
   });
 
-  it("handleMouse picks a list row and fires the trailing detail action rows", async () => {
+  it("handleMouse picks a list row and fires the hint rows above the bottom rule", async () => {
     const { popup, ui } = await setupWithPopup(["Silent assumption", "Hidden decision"], ["warning", "critical"]);
-    popup.component.handleMouse!(clickEvent(1)); // "1. [critical] Hidden decision" (newest first)
-    expect(renderOf(popup)).toContain("Heads up · Hidden decision"); // switched to detail
+    popup.component.handleMouse!(clickEvent(1)); // first framed body row: "1. [critical] Hidden decision"
+    expect(renderOf(popup)).toContain("✦ Heads up"); // switched to the framed detail card
+    expect(renderOf(popup)).toContain("Hidden decision");
 
-    // Detail rows: header(0), blank(1), detail(2), blank(3), then the 3-row hint block.
-    popup.component.handleMouse!(clickEvent(5)); // "2: Chat in main session"
+    // Framed detail rows: top(0), title(1), blank(2), detail(3), blank(4),
+    // hints(5-7), bottom rule(8) — the hint block sits just above the rule.
+    popup.component.handleMouse!(clickEvent(6)); // "2: Chat in main session"
     expect(ui.setEditorText).toHaveBeenCalledOnce();
     expect((ui.setEditorText.mock.calls[0]![0] as string)).toContain("Hidden decision");
     expect(popup.resolve).toHaveBeenCalledTimes(1); // chat closes the popup
   });
 
-  it("a detail text row that literally starts '2: Chat' is never an action", async () => {
+  it("clicking a wrapped list entry's FIRST row still opens its detail", async () => {
+    const longTitle = "Assumption that stretches across several wrapped popup rows at click width";
+    // Newest first: the long note is added LAST, so it renders as list row 1.
+    const { popup } = await setupWithPopup(["Short note", longTitle]);
+    // Its text wraps at the click rebuild width (60 cols, no render has run
+    // yet): row 1 is only its first wrapped fragment, and hitting it must
+    // still open the detail stage.
+    popup.component.handleMouse!(clickEvent(1));
+    const rows = popup.component.render?.(100) ?? [];
+    expect(rows.join("\n")).toContain("Assumption that stretches");
+    expect(rows.join("\n")).not.toContain("number to open"); // detail stage, not the list
+  });
+
+  it("a detail row that literally starts '2: Chat' is never an action", async () => {
     const { popup, ui } = await setupWithPopup(["2: Chat would be a mistake here"]);
     const rows = popup.component.render?.(100) ?? [];
-    const trickyAt = rows.findIndex((row, index) => index > 0 && row.includes("2: Chat would be a mistake"));
-    expect(trickyAt).toBeGreaterThan(0);
-    expect(trickyAt).toBeLessThan(rows.length - 3); // outside the trailing hint block
-
-    popup.component.handleMouse!(clickEvent(trickyAt));
-    expect(ui.setEditorText).not.toHaveBeenCalled(); // no action fired
-    expect(popup.resolve).not.toHaveBeenCalled(); // popup stays open
+    // The text appears on the severity title row AND the detail body row; the
+    // actionable block is the 3 hint rows just above the bottom rule, so both
+    // occurrences sit outside it and must stay inert.
+    const trickyAts = rows
+      .map((row, index) => ({ row, index }))
+      .filter(({ row }) => row.includes("2: Chat would be a mistake"))
+      .map(({ index }) => index);
+    expect(trickyAts.length).toBe(2);
+    for (const at of trickyAts) {
+      expect(at).toBeLessThan(rows.length - 1 - 3); // outside the framed actionable block
+      popup.component.handleMouse!(clickEvent(at));
+      expect(ui.setEditorText).not.toHaveBeenCalled(); // no action fired
+      expect(popup.resolve).not.toHaveBeenCalled(); // popup stays open
+    }
   });
 
   it("processing notes shrinks the sidebar tally and closes it when the last one is processed", async () => {
@@ -866,25 +901,31 @@ describe("you-should-know note popup", () => {
     expect(ui.custom).toHaveBeenCalledTimes(1); // only the sidebar so far
     const sidebar = customCalls[0]!;
 
-    // Header click -> all notes, list stage, newest first.
+    // Header click -> all notes, list stage, newest first. render(100):
+    // card title 10 chars -> fill 85; body pads = 100 - 4 - <text length>.
     sidebar.component.handleMouse!(clickEvent(0));
     expect(ui.custom).toHaveBeenCalledTimes(2);
     expect(customCalls[1]!.component.render?.(100)).toEqual([
-      "<muted>Heads up",
-      "<error>1. [critical] Critical note",
-      "<warning>2. [warning] Warning two",
-      "<warning>3. [warning] Warning one",
-      "<muted>number to open · Esc to close",
+      `<border>╭─ <accent>✦ Heads up<border> ${"─".repeat(85)}╮`,
+      // "1. [critical] Critical note" = 27 chars -> pad = 100 - 4 - 27 = 69
+      `<border>│ <error>1. [critical] Critical note<border>${" ".repeat(69)} │`,
+      // "2. [warning] Warning two" = 24 chars -> pad = 100 - 4 - 24 = 72
+      `<border>│ <warning>2. [warning] Warning two<border>${" ".repeat(72)} │`,
+      `<border>│ <warning>3. [warning] Warning one<border>${" ".repeat(72)} │`,
+      // hint = 29 chars -> pad = 100 - 4 - 29 = 67
+      `<border>│ <muted>number to open · Esc to close<border>${" ".repeat(67)} │`,
+      `<border>╰${"─".repeat(98)}╯`,
     ]);
 
     // Severity row click -> exactly that severity; the previous popup closed first.
     sidebar.component.handleMouse!(clickEvent(2)); // "■ 2 warning"
     expect(customCalls[1]!.resolve).toHaveBeenCalledTimes(1);
     expect(customCalls[2]!.component.render?.(100)).toEqual([
-      "<muted>Heads up",
-      "<warning>1. [warning] Warning two",
-      "<warning>2. [warning] Warning one",
-      "<muted>number to open · Esc to close",
+      `<border>╭─ <accent>✦ Heads up<border> ${"─".repeat(85)}╮`,
+      `<border>│ <warning>1. [warning] Warning two<border>${" ".repeat(72)} │`,
+      `<border>│ <warning>2. [warning] Warning one<border>${" ".repeat(72)} │`,
+      `<border>│ <muted>number to open · Esc to close<border>${" ".repeat(67)} │`,
+      `<border>╰${"─".repeat(98)}╯`,
     ]);
   });
 
@@ -898,14 +939,19 @@ describe("you-should-know note popup", () => {
 
     sidebar.component.handleMouse!(clickEvent(2)); // "■ 1 warning"
     expect(ui.custom).toHaveBeenCalledTimes(2);
+    // Framed detail card at render width 100: title 10 -> fill 85; body pads
+    // = 100 - 4 - <text length> ("Lone warning" = 12 -> 84; blanks -> 96;
+    // hint rows 13/23/10 -> 83/73/86).
     expect(customCalls[1]!.component.render?.(100)).toEqual([
-      "<warning>Heads up · Lone warning",
-      "<accent>",
-      "<accent>Lone warning",
-      "<accent>",
-      "<muted>1: Understood",
-      "<muted>2: Chat in main session",
-      "<muted>0: Dismiss",
+      `<border>╭─ <accent>✦ Heads up<border> ${"─".repeat(85)}╮`,
+      `<border>│ <warning>Lone warning<border>${" ".repeat(84)} │`,
+      `<border>│ <accent><border>${" ".repeat(96)} │`,
+      `<border>│ <accent>Lone warning<border>${" ".repeat(84)} │`,
+      `<border>│ <accent><border>${" ".repeat(96)} │`,
+      `<border>│ <muted>1: Understood<border>${" ".repeat(83)} │`,
+      `<border>│ <muted>2: Chat in main session<border>${" ".repeat(73)} │`,
+      `<border>│ <muted>0: Dismiss<border>${" ".repeat(86)} │`,
+      `<border>╰${"─".repeat(98)}╯`,
     ]);
   });
 });

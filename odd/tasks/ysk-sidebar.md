@@ -119,6 +119,23 @@ the fixed 26-col snapshot; widget.ts builders unchanged. Tests red first. Accept
 overlay options assert "100%"; renders at other widths produce exact-width cards;
 click routing unchanged; suite + tsc green.
 
+### T7. Full-brief popup card (user-requested 2026-10-15)
+`src/widget.ts` + `src/index.ts`: popup (both stages) becomes the same rounded card as
+the sidebar, larger (overlay width/maxHeight 60% -> 80%), and text WRAPS instead of
+truncating so the full title + detail brief is always visible (screenshot evidence:
+bare truncated rows, titles cut with "…"). Shared pure `frameCardRows(rows, title,
+width)` framer (extracted from sidebarCardRows, which delegates and keeps byte-identical
+output); new pure `wrapLine` (greedy word wrap, hard-breaks overlong words, no
+ellipsis in popup bodies); popupListRows/popupDetailRows return framed CardRow[] with
+"✦ Heads up" rule titles (list: numbered severity rows + hint; detail: severity title
+row, detail lines, hint block); noteIndexAtPopupRow/popupActionAtRow operate on CardRow
+and the action guard excludes the bottom rule (block = last A rows above it); index.ts
+overlay "80%"/"80%", popupRowWidth = floor/fallback of the render width pi-tui already
+provides (drops the wrong 0.6 re-ratio), render maps segments like the sidebar. Tests
+red first. Acceptance: no "…" in any popup body row; both stages framed at exact
+overlay width; click/keyboard routing preserved; suite + tsc green. Known cap:
+maxHeight still bounds height (pi-tui slices overflow; scrolling stays a non-goal).
+
 ## Evidence
 
 | Task | Commit | Result |
@@ -129,4 +146,5 @@ click routing unchanged; suite + tsc green.
 | Verify corrections | 6c514ce | gentle-ai-verify CONDITIONAL PASS -> three gaps fixed: sidebar click-to-popup wired (severityAtSidebarRow -> openPopup all/severity), list stage newest-first, strict mode===tui sidebar guard + rpc test. 168/168 green, tsc clean |
 | Native review | lineage: NONE — blocked | START over committed range b742e691..HEAD rejected 3x: controller returns empty-candidate workspace status (empty_candidate_base_ref_required) without creating a lineage; untracked selection (.pi/you-should-know.json) resolved via select-intended-untracked; START loop stopped per contract. No authority created or burned. Feature otherwise verified (168/168, tsc clean, API cross-check, adversarial sweep clean). Retry in a fresh session or via maintainer CLI. |
 | T5 card restyle | adece77 | gentle-ai-worker TDD (red -> green), gentle-ai-verify PASS (geometry matches gentle-pi shell-card arithmetic; popup untouched); degenerate-width coverage gap closed by parent; 169/169 green, tsc clean |
-| T6 full width | (this commit) | overlay width "100%" (pi-tui clamps to terminal - margins, passes resolved width to render); notes snapshot + per-frame card at render width, frame-rows hit-test cache (popup pattern); dynamic-width test at 40/100; gentle-ai-verify PASS; 170/170 green, tsc clean |
+| T6 full width | 303c77c | overlay width "100%" (pi-tui clamps to terminal - margins, passes resolved width to render); notes snapshot + per-frame card at render width, frame-rows hit-test cache (popup pattern); dynamic-width test at 40/100; gentle-ai-verify PASS; 170/170 green, tsc clean |
+| T7 popup card | (this commit) | shared frameCardRows framer (sidebar delegates, tests unmodified as parity net) + wrapLine (hard-break, no ellipsis); popup both stages framed "✦ Heads up" cards at 80%/80%, bodies pre-wrapped at width-4; hit-tests on framed body text, action block above bottom rule; popupRowWidth drops 0.6 re-ratio; gentle-ai-verify PASS; 188/188 green, tsc clean; cap noted: maxHeight still bounds height (scrolling stays non-goal) |
