@@ -277,13 +277,15 @@ describe("you-should-know wiring", () => {
     await flush();
     expect(registry.calls()).toHaveLength(1);
     expect(ui.custom).toHaveBeenCalledOnce();
-    // Card frame + one body row per non-zero severity, priority order, theme tokens applied.
+    // Card frame + one body row per non-zero severity, priority order, theme
+    // tokens applied, stretched to the render width (render(100) -> 100 cols:
+    // title 12 chars -> 100 - 12 - 5 = 83 fill dashes, etc.).
     expect(renderOf(customCalls[0]!)).toBe(
       [
-        "<border>╭─ <accent>✦ 2 heads-up<border> ─────────╮",
-        "<border>│ <error>■ 1 critical<border>           │",
-        "<border>│ <warning>■ 1 warning<border>            │",
-        "<border>╰────────────────────────╯",
+        `<border>╭─ <accent>✦ 2 heads-up<border> ${"─".repeat(83)}╮`,
+        `<border>│ <error>■ 1 critical<border>${" ".repeat(84)} │`,
+        `<border>│ <warning>■ 1 warning<border>${" ".repeat(85)} │`,
+        `<border>╰${"─".repeat(98)}╯`,
       ].join("\n"),
     );
 
@@ -572,18 +574,38 @@ describe("you-should-know tally sidebar overlay", () => {
     expect(open.opts?.overlay).toBe(true);
     expect(open.opts?.overlayOptions).toEqual({
       anchor: "right-center",
-      width: 26,
+      width: "100%",
       maxHeight: "80%",
       margin: 1,
       nonCapturing: true,
     });
-    // Card frame + one body row per non-zero severity, priority order, theme tokens applied.
+    // Card frame + one body row per non-zero severity, priority order, theme
+    // tokens applied, stretched to the render width (render(100) -> 100 cols:
+    // title 12 chars -> 100 - 12 - 5 = 83 fill dashes, etc.).
     expect(open.component.render?.(100)).toEqual([
-      "<border>╭─ <accent>✦ 2 heads-up<border> ─────────╮",
-      "<border>│ <error>■ 1 critical<border>           │",
-      "<border>│ <warning>■ 1 warning<border>            │",
-      "<border>╰────────────────────────╯",
+      `<border>╭─ <accent>✦ 2 heads-up<border> ${"─".repeat(83)}╮`,
+      `<border>│ <error>■ 1 critical<border>${" ".repeat(84)} │`,
+      `<border>│ <warning>■ 1 warning<border>${" ".repeat(85)} │`,
+      `<border>╰${"─".repeat(98)}╯`,
     ]);
+  });
+
+  it("renders the card edge to edge: rules match each rendered width exactly", async () => {
+    const { customCalls, handlers, ctx } = await setup({ config: { reviewEvery: 1 } });
+    handlers.get("agent_start")![0]({ type: "agent_start" }, ctx);
+    handlers.get("tool_execution_end")![0](toolEndEvent("a"), ctx);
+    await flush();
+    handlers.get("agent_end")![0]({ type: "agent_end", messages: [] }, ctx);
+    const open = customCalls[0]!;
+
+    // Visible columns = segment text lengths summed: strip the fake theme markup.
+    const visible = (line: string): string => line.replace(/<[^>]+>/g, "");
+    for (const width of [40, 100]) {
+      const rows = open.component.render?.(width) ?? [];
+      expect(rows.length).toBeGreaterThan(2); // top rule + body rows + bottom rule
+      expect(visible(rows[0]!).length).toBe(width); // top rule spans the width
+      expect(visible(rows.at(-1)!).length).toBe(width); // bottom rule too
+    }
   });
 
   it("refreshes the open sidebar in place when another note arrives while idle", async () => {

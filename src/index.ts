@@ -51,8 +51,12 @@ import {
 } from "./widget.ts";
 
 const USER_CONFIG_PATH = "~/.pi/agent/you-should-know.json";
-/** Column width of the tally sidebar overlay; rows are truncated to this. */
-const SIDEBAR_WIDTH = 26;
+/**
+ * Fallback row width for sidebar frames rendered without a width (tests, odd
+ * terminals) — not the overlay size: the sidebar overlay spans the full
+ * terminal width and every frame renders at the width pi-tui hands it.
+ */
+const SIDEBAR_FALLBACK_WIDTH = 26;
 /** Popup rows truncate to the overlay's 60% width, never below this. */
 const POPUP_WIDTH_MIN = 40;
 /** Popup overlay width as a fraction of the terminal width. */
@@ -110,12 +114,12 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   // and disposes the overlay, so the empty-snapshot path closes through pi
   // instead of tearing UI down by hand. sidebarHandle is the overlay handle;
   // sessionTui is the live TUI captured by the overlay factories (preferred
-  // repaint target for editor fills); sidebarSnapshot is the immutable row
-  // list every sidebar frame renders from.
+  // repaint target for editor fills); sidebarNotes is the immutable note
+  // snapshot every sidebar frame renders from.
   let sidebarDone: ((value: unknown) => void) | null = null;
   let sidebarHandle: OverlayHandleLike | null = null;
   let sessionTui: { requestRender: (force?: boolean) => void } | null = null;
-  let sidebarSnapshot: CardRow[] = [];
+  let sidebarNotes: Note[] = [];
   // Note popup overlay state (session-scoped, same done-capture pattern).
   // One popup at a time: opening a new one closes the previous first.
   let popupDone: ((value: unknown) => void) | null = null;
@@ -144,8 +148,8 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   // --- tally sidebar overlay ------------------------------------------------
 
   /**
-   * Sidebar writer: snapshot the pending-note tally, then open, refresh, or
-   * close the right-edge overlay so it always mirrors the store. Lives on the
+   * Sidebar writer: snapshot the pending notes, then open, refresh, or close
+   * the right-edge overlay so it always mirrors the store. Lives on the
    * same gated render path as the popup opens (idle requestRender +
    * loop-boundary flush), so mid-loop arrivals stay deferred behind the dirty
    * flag. Strictly TUI: headless and RPC contexts never touch the overlay.
@@ -156,8 +160,8 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     if (!ctx) return;
     try {
       if (!ctx.hasUI || ctx.mode !== "tui") return;
-      sidebarSnapshot = sidebarCardRows(store.pending, { width: SIDEBAR_WIDTH });
-      if (sidebarSnapshot.length === 0) {
+      sidebarNotes = [...store.pending];
+      if (sidebarNotes.length === 0) {
         // Empty tally and an open overlay: close it through pi's own done
         // (resolved + disposed by pi) and drop the handle so nothing stale
         // can touch the UI. Do not call custom() again until a new note lands.
@@ -186,25 +190,38 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   }
 
   /**
-   * Open the sidebar as a non-capturing right-center overlay. TUI-only: the
-   * open path refuses headless and RPC contexts even if called directly. The
-   * custom() promise is fire-and-forget with a quiet catch; done is captured
-   * inside the factory so the empty-snapshot path can close the overlay
-   * through pi later. Every deferred callback is generation-guarded: a stale
-   * session must not open, repaint, or capture UI state.
+   * Open the sidebar as a non-capturing right-center overlay spanning the
+   * full terminal width (width: "100%"); pi-tui resolves that against the
+   * terminal and calls render with the resolved width, so every frame
+   * rebuilds the card edge to edge. TUI-only: the open path refuses headless
+   * and RPC contexts even if called directly. The custom() promise is
+   * fire-and-forget with a quiet catch; done is captured inside the factory
+   * so the empty-snapshot path can close the overlay through pi later. Every
+   * deferred callback is generation-guarded: a stale session must not open,
+   * repaint, or capture UI state.
    */
   function openSidebar(ctx: ExtensionContext): void {
     if (!ctx.hasUI || ctx.mode !== "tui") return;
     const gen = generation;
+    // Rows of the most recent frame, for mouse hit-testing (the popup's
+    // popupRows pattern).
+    let sidebarFrameRows: CardRow[] = [];
+
+    /** Card rows of the current frame at the given width (render's single source). */
+    const frameRows = (width: number | undefined): CardRow[] =>
+      sidebarCardRows(sidebarNotes, { width: sidebarRowWidth(width) });
+
     void ctx.ui.custom(
       (tui, theme, _keybindings, done) => {
         sessionTui = tui; // plain assignment FIRST: capture even if the rest fails
         sidebarDone = done; // pi's own resolve: the close path hands it back
         return {
-          render: () => {
+          render: (width?: number) => {
             if (gen !== generation) return []; // stale generation renders nothing
-            // Frames redraw constantly: render only from the snapshot.
-            return sidebarSnapshot.map((row) =>
+            // Frames redraw constantly: rebuild the card at the render width
+            // from the notes snapshot.
+            sidebarFrameRows = frameRows(width);
+            return sidebarFrameRows.map((row) =>
               row.segments.map((segment) => theme.fg(severityColorToken(segment.token), segment.text)).join(""),
             );
           },
@@ -212,11 +229,14 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
           handleMouse: (event) => {
             if (gen !== generation) return undefined;
             if (event?.type !== "click" || event.button !== "left") return undefined;
+            // Hit-test against the rows pi actually rendered; if no frame
+            // has been drawn yet, derive them from the event's own width.
+            if (sidebarFrameRows.length === 0) sidebarFrameRows = frameRows(event?.width);
             // Click routing: the card rows decide what a click selects
             // (title -> all, a body row's middle segment -> its severity).
             // The overlay is nonCapturing, so opening the popup never steals
             // focus from the editor beforehand — the popup captures its own.
-            const hit = severityAtSidebarCardRow(sidebarSnapshot, event.y);
+            const hit = severityAtSidebarCardRow(sidebarFrameRows, event.y);
             if (hit === null) return undefined;
             openPopup(hit === "all" ? { all: true } : { severity: hit });
             return { handled: true };
@@ -227,7 +247,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
         overlay: true,
         overlayOptions: {
           anchor: "right-center",
-          width: SIDEBAR_WIDTH,
+          width: "100%",
           maxHeight: "80%",
           margin: 1,
           nonCapturing: true,
@@ -253,7 +273,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     sidebarDone = null;
     sidebarHandle = null;
     sessionTui = null;
-    sidebarSnapshot = [];
+    sidebarNotes = [];
     if (!finish) return;
     try {
       finish(undefined);
@@ -289,6 +309,18 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
         ? Math.floor(viewportWidth * POPUP_WIDTH_RATIO)
         : POPUP_WIDTH_MIN;
     return Math.max(POPUP_WIDTH_MIN, usable);
+  }
+
+  /**
+   * Row width for sidebar frames: render receives the overlay's resolved
+   * full width from pi-tui (the "100%" overlay option resolved against the
+   * terminal, clamped to the margins). Finite widths floor to at least 1;
+   * anything else falls back to SIDEBAR_FALLBACK_WIDTH (tests, odd terminals).
+   */
+  function sidebarRowWidth(viewportWidth: number | undefined): number {
+    return typeof viewportWidth === "number" && Number.isFinite(viewportWidth)
+      ? Math.max(1, Math.floor(viewportWidth))
+      : SIDEBAR_FALLBACK_WIDTH;
   }
 
   /**
