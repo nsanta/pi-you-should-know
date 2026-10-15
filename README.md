@@ -14,9 +14,10 @@ and fails quiet by design.
 - The reviewer returns at most 2 notes; notes whose topic was dismissed are dropped
   before they are ever stored.
 - A pending note becomes visible **when the current agent answer completes**
-  (`agent_end`/`agent_settled`) — mid-loop findings stay queued so the sidebar never
-  interrupts work — and are surfaced in a **tally sidebar** docked to the right edge of
-  the terminal (severity-colored, keyboard-focus-free).
+  (`agent_end`/`agent_settled`) — mid-loop findings stay queued so the card never
+  interrupts work — and are surfaced in a severity-colored **heads-up card** that docks
+  into gentle-pi's fullscreen right rail when available, or renders as a compact tally
+  at the right edge otherwise (keyboard-focus-free in both cases).
 - The agent can also record notes directly through the `heads_up` tool.
 - Pending notes are **persisted per project** in `.pi/you-should-know-notes.json`, so
   unprocessed notes survive closing and reloading pi (see below).
@@ -35,6 +36,25 @@ While unprocessed notes exist, a compact tally is docked to the **right edge**:
 
 One row per non-zero severity, priority order (critical > warning > info); the sidebar
 never takes keyboard focus.
+
+### Where the heads-up card shows up
+
+The card has two surfaces, and it never shows in both places at once:
+
+- **In gentle-pi's fullscreen shell**, the card docks into the experimental right rail
+  (below the Status/Todos cards) titled `✦ Heads up · N`, with one severity-colored
+  `■ <title>` row per pending note — newest first, long titles wrapped, never truncated.
+  Clicking a note row opens that note's detail popup directly. Note changes refresh the
+  rail automatically; `Esc`/popup actions work exactly as described below.
+- **Everywhere else** (regular pi sessions, other runtimes, terminals without the rail),
+  the same card renders as a compact tally docked to the right edge — the severity
+  counts shown above in a card spanning 30% of the terminal (at least 24 columns).
+
+While the fullscreen rail hosts the card, the right-edge overlay deliberately paints
+nothing (so the tally is never shown twice), and switching between fullscreen and
+regular mode needs no reopen. The rail integration is best-effort: if the rail is
+unavailable or its internals change, the extension silently falls back to the
+right-edge tally, and `/ysk` keeps working everywhere.
 
 - **Click a severity row** (or the header for all notes) to open the popup. With one
   matching note it opens the detail directly; with several it shows a numbered list

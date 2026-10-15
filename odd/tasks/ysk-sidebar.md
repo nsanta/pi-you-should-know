@@ -153,6 +153,24 @@ generation-guarded), best-effort quiet failures throughout. README documents the
 state file and semantics. Tests red first. Acceptance: notes file round-trips;
 reload restores the tally; corrupt file degrades to empty; suite + tsc green.
 
+### T9. Dock the heads-up card in the Gentle Shell rail (user-requested 2026-10-15)
+Product decision (user): the full-width card covers the whole view; display it like the
+todos extension and Status card (screenshot: gentle shell right rail). Integration
+(best-effort, quiet degradation): detect gentle-pi's experimental fullscreen rail via
+`Symbol.for("gentle-pi.experimental-sidebar.state")` / `.cache` on tui.terminal; when
+present, a `you-should-know` setWidget registers a "ysk" rail part (Component +
+digest) that renders the heads-up card in the rail column: title `✦ Heads up · N`, one
+severity-colored wrapped `■ <title>` row-group per pending note (newest first), click
+on a note row -> popup detail; note changes bump the cache revision (invalidate) +
+digest revalidation. The tally overlay suppresses its paint while the rail is active
+(state.active && ownsHost) so the card never shows twice. Fallback (no rail / regular
+mode): the overlay drops to width "30%" + minWidth 24 and keeps the counts-only tally
+card (2026-02-18 product decision). All rail access try/catch quiet; absent or changed
+gentle-pi internals degrade to the overlay. widget.ts: railHeadsUpRows(notes, {width})
+-> { rows, noteAtRow } via frameCardRows + wrappedLines. Tests red first. Acceptance:
+rail part renders exact card at rail width, click routes, overlay suppressed when
+rail active, fallback intact without gentle-pi; suite + tsc green.
+
 ## Evidence
 
 | Task | Commit | Result |
@@ -161,6 +179,7 @@ reload restores the tally; corrupt file degrades to empty; suite + tsc green.
 | T2 sidebar wiring | e14bc7a | 172/172 green, tsc clean; nonCapturing right-center overlay, snapshot-first render, done-capture close, generation guards, session cleanup, fillEditor repaint via sessionTui; band coexists until T3; risk noted: sync factory invocation assumed (same as band) |
 | T3 popup + processed | 0ef86bb | 165/165 green, tsc clean, grep acceptance met (no band/key remnants in src); popup list/detail stages, mouse+keys, kitty-safe Esc, positional hit-guard, processed semantics (understood+chat -> dismissSession), /ysk popup parity, smoke test updated via approved unblock (smoke surface added by parent decision); pi-tui re-added for matchesKey |
 | Verify corrections | 6c514ce | gentle-ai-verify CONDITIONAL PASS -> three gaps fixed: sidebar click-to-popup wired (severityAtSidebarRow -> openPopup all/severity), list stage newest-first, strict mode===tui sidebar guard + rpc test. 168/168 green, tsc clean |
+| T9 rail docking | (this commit) | gentle rail integration via Symbol.for state/cache (best-effort, silent degradation): "ysk" rail part renders railHeadsUpRows (newest-first per-note wrapped rows, digest + revision-bump freshness, click -> detail popup); overlay suppressed (render + mouse) while rail owns host; fallback compacted to 30% + minWidth 24 counts card; relay-feature preservation honored (teardown lines, factory overrides, setupRelay). Landed around a concurrent relay worker: builder/tests absorbed into ae662f8/a30b9f9, wiring committed here. gentle-ai-verify PASS; 268/268 x2 (worker x3), tsc clean |
 | Native review | lineage: NONE — blocked | START over committed range b742e691..HEAD rejected 3x: controller returns empty-candidate workspace status (empty_candidate_base_ref_required) without creating a lineage; untracked selection (.pi/you-should-know.json) resolved via select-intended-untracked; START loop stopped per contract. No authority created or burned. Feature otherwise verified (168/168, tsc clean, API cross-check, adversarial sweep clean). Retry in a fresh session or via maintainer CLI. |
 | T5 card restyle | adece77 | gentle-ai-worker TDD (red -> green), gentle-ai-verify PASS (geometry matches gentle-pi shell-card arithmetic; popup untouched); degenerate-width coverage gap closed by parent; 169/169 green, tsc clean |
 | T6 full width | 303c77c | overlay width "100%" (pi-tui clamps to terminal - margins, passes resolved width to render); notes snapshot + per-frame card at render width, frame-rows hit-test cache (popup pattern); dynamic-width test at 40/100; gentle-ai-verify PASS; 170/170 green, tsc clean |

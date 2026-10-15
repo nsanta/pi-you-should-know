@@ -261,6 +261,55 @@ async function setupWithPopup(noteTexts: string[], severities?: string[]) {
   };
 }
 
+// --- gentle-pi experimental fullscreen rail fixtures (T9) ---------------------
+
+const GENTLE_STATE = Symbol.for("gentle-pi.experimental-sidebar.state");
+const GENTLE_CACHE = Symbol.for("gentle-pi.experimental-sidebar.cache");
+
+/** The planted gentle-pi sidebar state + invalidation cache on a fake TUI. */
+interface PlantedRail {
+  state: { active: boolean; ownsHost: ReturnType<typeof vi.fn>; parts: Map<string, any> };
+  cache: { revision: number };
+}
+
+/** The subset of the widget/rail component surface the rail tests drive. */
+interface RailSurface {
+  render?: (width?: number) => string[];
+  digest?: () => string;
+  handleMouse?: (event: unknown) => unknown;
+  invalidate?: () => void;
+  dispose?: () => void;
+}
+
+/**
+ * Plant a gentle-pi experimental sidebar (state + cache behind the two
+ * Symbol.for keys) on the fake TUI's terminal, exactly as the real shell
+ * stores them.
+ */
+function plantGentleRail(fakeTui: Record<string, unknown>): PlantedRail {
+  const rail: PlantedRail = {
+    state: { active: false, ownsHost: vi.fn(() => false), parts: new Map() },
+    cache: { revision: 0 },
+  };
+  fakeTui.terminal = { [GENTLE_STATE]: rail.state, [GENTLE_CACHE]: rail.cache };
+  return rail;
+}
+
+/** The you-should-know widget factory recorded by setWidget, invoked against the planted TUI. */
+function invokeWidget(session: Awaited<ReturnType<typeof setup>>, rail: PlantedRail): { component: RailSurface; part: RailSurface } {
+  const call = session.ui.setWidget.mock.calls.find((entry) => entry[0] === "you-should-know");
+  if (!call) throw new Error("you-should-know widget was not registered");
+  const component = (call[1] as (tui: unknown, theme: unknown) => RailSurface)(session.fakeOverlayTui, fakeTheme);
+  const part = rail.state.parts.get("ysk");
+  if (!part) throw new Error("ysk rail part was not registered");
+  return { component, part };
+}
+
+const RAIL_NOTES = [
+  { topic: "silent assumption", severity: "warning", title: "Silent assumption", detail: "detail a" },
+  { topic: "hidden decision", severity: "critical", title: "Hidden decision", detail: "detail b" },
+];
+
 // --- tests -------------------------------------------------------------------
 
 describe("you-should-know wiring", () => {
@@ -602,7 +651,8 @@ describe("you-should-know tally sidebar overlay", () => {
     expect(open.opts?.overlay).toBe(true);
     expect(open.opts?.overlayOptions).toEqual({
       anchor: "right-center",
-      width: "100%",
+      width: "30%",
+      minWidth: 24,
       maxHeight: "80%",
       margin: 1,
       nonCapturing: true,
@@ -723,6 +773,120 @@ describe("you-should-know tally sidebar overlay", () => {
     handlers.get("tool_execution_end")![0](toolEndEvent("rpc-1"), ctx);
     await flush();
     expect(ui.custom).not.toHaveBeenCalled();
+  });
+});
+
+// --- gentle-pi experimental fullscreen rail (T9) --------------------------------
+
+describe("you-should-know gentle-pi fullscreen rail", () => {
+  it("session_start registers a widget whose factory docks a ysk part into the planted rail", async () => {
+    const session = await setup({ notes: RAIL_NOTES });
+    const rail = plantGentleRail(session.fakeOverlayTui);
+    const { component } = invokeWidget(session, rail);
+    // Regular-mode presence stays empty: the overlay is the non-rail surface.
+    expect(component.render?.(100)).toEqual([]);
+    expect(rail.state.parts.get("ysk")).toBeDefined();
+  });
+
+  it("the ysk part renders the exact themed heads-up card at rail width 48, newest first", async () => {
+    const session = await setup({ notes: RAIL_NOTES });
+    const rail = plantGentleRail(session.fakeOverlayTui);
+    const { part } = invokeWidget(session, rail);
+    // Newest first: the critical "Hidden decision" (added last in the seed) leads.
+    expect(part.render?.(48)).toEqual([
+      `<border>╭─ <accent>✦ Heads up · 2<border> ${"─".repeat(29)}╮`,
+      `<border>│ <error>■ Hidden decision<border>${" ".repeat(27)} │`,
+      `<border>│ <warning>■ Silent assumption<border>${" ".repeat(25)} │`,
+      `<border>╰${"─".repeat(46)}╯`,
+    ]);
+    // Cheap memo key for gentle-pi's section cache: the oldest-first snapshot.
+    expect(part.digest?.()).toBe(JSON.stringify(RAIL_NOTES));
+  });
+
+  it("clicking a note row opens that note's detail popup directly", async () => {
+    const session = await setup({ notes: RAIL_NOTES });
+    const rail = plantGentleRail(session.fakeOverlayTui);
+    const { part } = invokeWidget(session, rail);
+    part.render?.(48);
+    const opens = session.ui.custom.mock.calls.length;
+    expect(part.handleMouse?.(clickEvent(1))).toEqual({ handled: true }); // row 1 -> first rendered note
+    expect(session.ui.custom.mock.calls.length).toBe(opens + 1);
+    const popup = session.customCalls.at(-1)!;
+    const rows = popup.component.render?.(100) ?? [];
+    expect(rows.join("\n")).toContain("Hidden decision"); // a Note target skips the list stage
+    expect(rows.join("\n")).toContain("detail b");
+  });
+
+  it("a click on a wrapped continuation row does nothing; the group's first row still opens", async () => {
+    const session = await setup({
+      notes: [{ topic: "wrap topic", severity: "info", title: "A very long title that must wrap across several rail rows", detail: "d" }],
+    });
+    const rail = plantGentleRail(session.fakeOverlayTui);
+    const { part } = invokeWidget(session, rail);
+    part.render?.(48);
+    const opens = session.ui.custom.mock.calls.length;
+    expect(part.handleMouse?.(clickEvent(2))).toBeUndefined(); // "several rail rows" continuation
+    expect(session.ui.custom.mock.calls.length).toBe(opens); // no popup
+    expect(part.handleMouse?.(clickEvent(1))).toEqual({ handled: true }); // first row opens
+    expect(session.ui.custom.mock.calls.length).toBe(opens + 1);
+  });
+
+  it("changing notes (tool add) bumps the rail cache revision so the rail re-renders", async () => {
+    const session = await setup({ notes: RAIL_NOTES });
+    const rail = plantGentleRail(session.fakeOverlayTui);
+    invokeWidget(session, rail);
+    const before = rail.cache.revision;
+    await addNoteViaTool(session.tools, "Fresh rail note", "info");
+    session.handlers.get("tool_execution_end")![0](toolEndEvent("rail-1"), session.ctx);
+    expect(rail.cache.revision).toBeGreaterThan(before);
+  });
+
+  it("the tally overlay paints nothing while the gentle rail owns the host, and returns on mode switch", async () => {
+    const session = await setup({ notes: RAIL_NOTES });
+    const rail = plantGentleRail(session.fakeOverlayTui);
+    invokeWidget(session, rail);
+    const sidebar = session.customCalls[0]!;
+    expect(renderOf(sidebar)).toContain("2 heads-up"); // fallback renders normally while inactive
+
+    rail.state.active = true;
+    rail.state.ownsHost = vi.fn(() => true);
+    expect(sidebar.component.render?.(100)).toEqual([]); // suppressed: the rail paints the card
+
+    // active but NOT owning the host (e.g. narrow mode): the overlay shows again.
+    rail.state.ownsHost = vi.fn(() => false);
+    expect(renderOf(sidebar)).toContain("2 heads-up");
+
+    rail.state.ownsHost = vi.fn(() => true);
+    rail.state.active = false;
+    expect(renderOf(sidebar)).toContain("2 heads-up"); // mode switch needs no reopen logic
+  });
+
+  it("dispose removes only its own ysk part", async () => {
+    const session = await setup({ notes: RAIL_NOTES });
+    const rail = plantGentleRail(session.fakeOverlayTui);
+    const { component, part } = invokeWidget(session, rail);
+    expect(rail.state.parts.get("ysk")).toBe(part);
+
+    // Someone else owns the slot now: our dispose must not delete theirs.
+    const replacement: RailSurface = { render: () => [] };
+    rail.state.parts.set("ysk", replacement);
+    component.dispose?.();
+    expect(rail.state.parts.get("ysk")).toBe(replacement);
+
+    // A fresh factory re-registers, and its own dispose removes the part.
+    const fresh = invokeWidget(session, rail);
+    expect(rail.state.parts.get("ysk")).toBe(fresh.part);
+    fresh.component.dispose?.();
+    expect(rail.state.parts.has("ysk")).toBe(false);
+  });
+
+  it("without a gentle rail state no part registers and the fallback overlay renders the card normally", async () => {
+    const session = await setup({ notes: RAIL_NOTES }); // no terminal planted: no rail symbols
+    const call = session.ui.setWidget.mock.calls.find((entry) => entry[0] === "you-should-know");
+    expect(call).toBeDefined();
+    const component = (call![1] as (tui: unknown, theme: unknown) => RailSurface)(session.fakeOverlayTui, fakeTheme);
+    expect(component.render?.(100)).toEqual([]); // the widget paints nothing without a rail
+    expect(renderOf(session.customCalls[0]!)).toContain("2 heads-up"); // regression: the fallback card
   });
 });
 

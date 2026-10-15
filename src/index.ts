@@ -79,6 +79,9 @@ const GENTLE_RAIL_CACHE = Symbol.for("gentle-pi.experimental-sidebar.cache");
 /** The key this extension registers its rail part under. */
 const RAIL_PART_KEY = "ysk";
 
+/** The widget key this extension registers (factory registration + teardown). */
+const RAIL_WIDGET_KEY = "you-should-know";
+
 /** Structural view of one rail part; only these members are ever touched. */
 interface GentleRailComponent {
   render: (width?: number) => string[];
@@ -388,15 +391,18 @@ export default function youShouldKnowExtension(
   }
 
   /**
-   * Open the sidebar as a non-capturing right-center overlay spanning the
-   * full terminal width (width: "100%"); pi-tui resolves that against the
+   * Open the sidebar as a non-capturing right-center overlay spanning 30% of
+   * the terminal (minWidth 24; pi-tui resolves the percentage against the
    * terminal and calls render with the resolved width, so every frame
-   * rebuilds the card edge to edge. TUI-only: the open path refuses headless
-   * and RPC contexts even if called directly. The custom() promise is
-   * fire-and-forget with a quiet catch; done is captured inside the factory
-   * so the empty-snapshot path can close the overlay through pi later. Every
-   * deferred callback is generation-guarded: a stale session must not open,
-   * repaint, or capture UI state.
+   * rebuilds the card at that width). This overlay is the FALLBACK surface:
+   * when gentle-pi's fullscreen rail is active and owns the host, the render
+   * paints nothing (the rail renders the card instead) — the overlay stays
+   * open so a mode switch back needs no reopen logic. TUI-only: the open path
+   * refuses headless and RPC contexts even if called directly. The custom()
+   * promise is fire-and-forget with a quiet catch; done is captured inside
+   * the factory so the empty-snapshot path can close the overlay through pi
+   * later. Every deferred callback is generation-guarded: a stale session
+   * must not open, repaint, or capture UI state.
    */
   function openSidebar(ctx: ExtensionContext): void {
     if (!ctx.hasUI || ctx.mode !== "tui") return;
@@ -416,6 +422,9 @@ export default function youShouldKnowExtension(
         return {
           render: (width?: number) => {
             if (gen !== generation) return []; // stale generation renders nothing
+            // Fullscreen-rail mode: the gentle rail paints the card, so the
+            // overlay stays open but paints nothing (never the card twice).
+            if (gentleRailOwnsHost(tui)) return [];
             // Frames redraw constantly: rebuild the card at the render width
             // from the notes snapshot.
             sidebarFrameRows = frameRows(width);
@@ -426,6 +435,7 @@ export default function youShouldKnowExtension(
           invalidate: () => {},
           handleMouse: (event) => {
             if (gen !== generation) return undefined;
+            if (gentleRailOwnsHost(tui)) return undefined; // invisible card: never clickable
             if (event?.type !== "click" || event.button !== "left") return undefined;
             // Hit-test against the rows pi actually rendered; if no frame
             // has been drawn yet, derive them from the event's own width.
@@ -446,7 +456,8 @@ export default function youShouldKnowExtension(
         overlay: true,
         overlayOptions: {
           anchor: "right-center",
-          width: "100%",
+          width: "30%",
+          minWidth: 24,
           maxHeight: "80%",
           margin: 1,
           nonCapturing: true,
@@ -516,9 +527,10 @@ export default function youShouldKnowExtension(
 
   /**
    * Row width for sidebar frames: render receives the overlay's resolved
-   * full width from pi-tui (the "100%" overlay option resolved against the
-   * terminal, clamped to the margins). Finite widths floor to at least 1;
-   * anything else falls back to SIDEBAR_FALLBACK_WIDTH (tests, odd terminals).
+   * width from pi-tui (the "30%" overlay option resolved against the
+   * terminal, minWidth 24, clamped to the margins). Finite widths floor to
+   * at least 1; anything else falls back to SIDEBAR_FALLBACK_WIDTH (tests,
+   * odd terminals).
    */
   function sidebarRowWidth(viewportWidth: number | undefined): number {
     return typeof viewportWidth === "number" && Number.isFinite(viewportWidth)
@@ -664,6 +676,95 @@ export default function youShouldKnowExtension(
 
   // --- session lifecycle ---------------------------------------------------
 
+  /**
+   * Register the you-should-know widget (TUI-only). The widget's regular-mode
+   * presence is deliberately empty (render: () => []) — the tally overlay
+   * stays the visible surface outside the fullscreen shell. Its job is to
+   * host the "ysk" part in gentle-pi's experimental fullscreen rail when the
+   * live TUI carries the rail state: the part renders the per-note heads-up
+   * card (newest first), reports a cheap digest for the rail's section
+   * cache, and routes row clicks to the note popup (a Note target opens the
+   * detail stage directly). Without a rail state no part registers and the
+   * widget paints nothing: best-effort and quiet, with every gentle-pi
+   * internals change degrading silently to the overlay.
+   */
+  function registerRailWidget(ctx: ExtensionContext): void {
+    if (!ctx.hasUI || ctx.mode !== "tui") return;
+    try {
+      ctx.ui.setWidget(RAIL_WIDGET_KEY, (tui, theme) => {
+        const railState = gentleRailState(tui);
+        const gen = generation;
+        // The most recent rail frame (rows, note mapping, and the notes they
+        // were built from), for mouse hit-testing — the overlays' frameRows
+        // pattern.
+        let railFrameRows: CardRow[] = [];
+        let railNoteAtRow: (number | null)[] = [];
+        let railFrameNotes: Note[] = [];
+        const railPart: GentleRailComponent | null =
+          railState === null
+            ? null
+            : {
+                render: (width?: number) => {
+                  if (gen !== generation) return []; // stale session renders nothing
+                  railFrameNotes = newestFirst(sidebarNotes);
+                  const built = railHeadsUpRows(railFrameNotes, { width: sidebarRowWidth(width) });
+                  railFrameRows = built.rows;
+                  railNoteAtRow = built.noteAtRow;
+                  return built.rows.map((row) =>
+                    row.segments.map((segment) => theme.fg(severityColorToken(segment.token), segment.text)).join(""),
+                  );
+                },
+                // Cheap memo key for gentle-pi's section cache: the raw
+                // oldest-first snapshot; any content change revalidates.
+                digest: () => JSON.stringify(sidebarNotes),
+                handleMouse: (event) => {
+                  if (gen !== generation) return undefined;
+                  if (event?.type !== "click" || event.button !== "left") return undefined;
+                  // Hit-test against the rows the part actually rendered;
+                  // before the first render there is nothing to hit.
+                  const hit =
+                    typeof event?.y === "number" && Number.isInteger(event.y) ? railNoteAtRow[event.y] : undefined;
+                  const note = typeof hit === "number" ? railFrameNotes[hit] : undefined;
+                  if (!note) return undefined;
+                  openPopup(note);
+                  return { handled: true };
+                },
+                invalidate: () => {},
+                dispose: () => disposeRailPart(railPart),
+              };
+        const disposeRailPart = (part: GentleRailComponent | null): void => {
+          const parts = railState?.parts;
+          if (part === null || !(parts instanceof Map)) return;
+          try {
+            // Guard: only remove the slot when it is still ours — a replaced
+            // registration (or a squatter) must never be deleted by proxy.
+            if (parts.get(RAIL_PART_KEY) === part) parts.delete(RAIL_PART_KEY);
+          } catch {
+            // quiet: part disposal is best-effort
+          }
+        };
+        if (railState !== null && railPart !== null && railState.parts instanceof Map) {
+          railTui = tui; // remember the TUI whose rail hosts us, for invalidation
+          railHostConnected = true;
+          try {
+            railState.parts.set(RAIL_PART_KEY, railPart);
+          } catch {
+            // quiet: part registration is best-effort
+          }
+        }
+        return {
+          // Regular-mode presence stays empty on purpose: outside the
+          // fullscreen rail the tally overlay is the visible surface.
+          render: () => [],
+          invalidate: () => {},
+          dispose: () => disposeRailPart(railPart),
+        };
+      });
+    } catch {
+      // quiet: widget registration must never crash the session
+    }
+  }
+
   pi.on("session_start", (_event: SessionStartEvent, ctx: ExtensionContext) => initSession(ctx));
 
   async function initSession(ctx: ExtensionContext): Promise<void> {
@@ -675,6 +776,11 @@ export default function youShouldKnowExtension(
     renderDirty = false;
     resetSidebar(); // close the replaced session's overlays; the new one reopens on demand
     closePopup();
+    // Replace the widget for the new session; forget the old rail connection
+    // until pi invokes the fresh factory (which re-registers the "ysk" part).
+    railHostConnected = false;
+    railTui = null;
+    registerRailWidget(ctx);
     counter = new StepCounter();
     try {
       const cwd = typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
@@ -778,7 +884,7 @@ export default function youShouldKnowExtension(
     }
   }
 
-  pi.on("session_shutdown", (_event: SessionShutdownEvent, _ctx: ExtensionContext) => {
+  pi.on("session_shutdown", (_event: SessionShutdownEvent, ctx: ExtensionContext) => {
     generation += 1; // invalidate in-flight fire-and-forget work
     try {
       currentController?.abort();
@@ -791,6 +897,16 @@ export default function youShouldKnowExtension(
     renderDirty = false;
     resetSidebar();
     closePopup();
+    // Drop the widget (its dispose removes the rail part) so a dead session
+    // never keeps a rail slot. TUI-guarded like every other UI touch, and
+    // quiet beside the relay teardown below.
+    railHostConnected = false;
+    railTui = null;
+    try {
+      if (ctx?.hasUI && ctx.mode === "tui") ctx.ui.setWidget(RAIL_WIDGET_KEY, undefined);
+    } catch {
+      // quiet: widget teardown at a session boundary is best-effort
+    }
     try {
       relayWatcher?.close(); // stop event-triggered rescans; scanNow dies with the watcher reference
     } catch {
