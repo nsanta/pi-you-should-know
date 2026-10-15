@@ -7,6 +7,7 @@ import {
   popupActionAtRow,
   popupDetailRows,
   popupListRows,
+  railHeadsUpRows,
   severityAtSidebarCardRow,
   severityColorToken,
   severityLabel,
@@ -19,6 +20,10 @@ import type { Note } from "../src/notes.ts";
 
 function note(overrides: Partial<Note> = {}): Note {
   return { topic: "topic", severity: "info", title: "A title", detail: "Some detail", ...overrides };
+}
+
+function subagentNote(overrides: Partial<Note> = {}): Note {
+  return note({ origin: { via: "subagent", cwd: "/home/child/ws", sessionId: "s" }, ...overrides });
 }
 
 /** Full row text: every segment joined (frame runs included). */
@@ -44,6 +49,10 @@ describe("severity mappings", () => {
 
   it("maps the border frame token -> itself", () => {
     expect(severityColorToken("border")).toBe("border");
+  });
+
+  it("maps the subagent pseudo-severity -> the muted token (themed dim)", () => {
+    expect(severityColorToken("subagent")).toBe("muted");
   });
 
   it("maps severity -> display label", () => {
@@ -260,6 +269,20 @@ describe("sidebarCardRows", () => {
       expect(columns).toBe(26);
     }
   });
+
+  it("appends one trailing '■ <n> subagent' row only when subagent-origin notes are pending", () => {
+    // No subagent origin: no extra row (existing behavior unchanged).
+    expect(sidebarCardRows([note()], { width: 26 }).map(rowBody)).toEqual(["✦ 1 head-up", "■ 1 info", ""]);
+
+    const notes = [subagentNote(), note({ severity: "critical" }), subagentNote({ severity: "warning" })];
+    const rows = sidebarCardRows(notes, { width: 26 });
+    expect(rows.map(rowBody)).toEqual(["✦ 3 heads-up", "■ 1 critical", "■ 1 warning", "■ 1 info", "■ 2 subagent", ""]);
+    expect(rows[rows.length - 2]!.segments[1]).toEqual({ token: "subagent", text: "■ 2 subagent" });
+    for (const row of rows) {
+      const columns = row.segments.reduce((total, segment) => total + segment.text.length, 0);
+      expect(columns).toBe(26);
+    }
+  });
 });
 
 describe("severityAtSidebarCardRow", () => {
@@ -281,6 +304,99 @@ describe("severityAtSidebarCardRow", () => {
     expect(severityAtSidebarCardRow(rows, 5)).toBeNull();
     expect(severityAtSidebarCardRow(rows, 1.5)).toBeNull();
     expect(severityAtSidebarCardRow([], 0)).toBeNull();
+  });
+
+  it("resolves the trailing subagent pool row to the 'subagent' hit", () => {
+    const withPool = sidebarCardRows([subagentNote(), note({ severity: "critical" })], { width: 26 });
+    // top, critical, info, subagent, bottom rule
+    expect(severityAtSidebarCardRow(withPool, 1)).toBe("critical");
+    expect(severityAtSidebarCardRow(withPool, 2)).toBe("info");
+    expect(severityAtSidebarCardRow(withPool, 3)).toBe("subagent");
+    expect(severityAtSidebarCardRow(withPool, 4)).toBeNull(); // bottom rule
+  });
+});
+
+describe("railHeadsUpRows", () => {
+  it("frames one severity-colored wrapped row-group per note in array order at width 48", () => {
+    const { rows, noteAtRow } = railHeadsUpRows(
+      [note({ severity: "critical", title: "Hidden decision" }), note()],
+      { width: 48 },
+    );
+    expect(rows).toEqual([
+      {
+        segments: [
+          { token: "border", text: "╭─ " },
+          { token: "info", text: "✦ Heads up · 2" },
+          { token: "border", text: ` ${"─".repeat(29)}╮` }, // fill = 48 - 14 - 5
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "critical", text: "■ Hidden decision" },
+          { token: "border", text: `${" ".repeat(27)} │` }, // pad = 44 - 17
+        ],
+      },
+      {
+        segments: [
+          { token: "border", text: "│ " },
+          { token: "info", text: "■ A title" },
+          { token: "border", text: `${" ".repeat(35)} │` }, // pad = 44 - 9
+        ],
+      },
+      { segments: [{ token: "border", text: `╰${"─".repeat(46)}╯` }] },
+    ]);
+    // Parallel to rows: frame rules and continuations are null, first rows map.
+    expect(noteAtRow).toEqual([null, 0, 1, null]);
+  });
+
+  it("keeps array order (display order is the caller's job), not severity priority", () => {
+    const { rows, noteAtRow } = railHeadsUpRows([note(), note({ severity: "critical", title: "B" })], { width: 48 });
+    expect(noteAtRow).toEqual([null, 0, 1, null]);
+    expect(rows[1]!.segments[1]).toEqual({ token: "info", text: "■ A title" });
+    expect(rows[2]!.segments[1]).toEqual({ token: "critical", text: "■ B" });
+  });
+
+  it("wraps long titles instead of truncating: continuations keep the severity, no prefix, no ellipsis", () => {
+    const { rows, noteAtRow } = railHeadsUpRows(
+      [note({ severity: "warning", title: "Hidden decision shipped silently without a trace" })],
+      { width: 48 },
+    );
+    // "■ Hidden decision shipped silently without a trace" wraps at the 44-col inner width.
+    expect(rows.map(rowBody)).toEqual(["✦ Heads up · 1", "■ Hidden decision shipped silently without a", "trace", ""]);
+    expect(rows[2]!.segments[1]).toEqual({ token: "warning", text: "trace" }); // continuation: severity, no prefix
+    expect(noteAtRow).toEqual([null, 0, null, null]); // only the group's first row maps
+    expect(rows.map(rowText).join("\n")).not.toContain("…");
+    for (const row of rows) expect(rowText(row)).toHaveLength(48);
+  });
+
+  it("falls back to the topic when the title is blank", () => {
+    const { rows, noteAtRow } = railHeadsUpRows([note({ title: "   ", topic: "silent assumption" })], { width: 48 });
+    expect(rowBody(rows[1]!)).toBe("■ silent assumption");
+    expect(noteAtRow).toEqual([null, 0, null]);
+  });
+
+  it("skips non-object entries without renumbering the surviving notes' indices", () => {
+    const { rows, noteAtRow } = railHeadsUpRows([null as unknown as Note, note({ title: "Real" })], { width: 48 });
+    // The skipped entry renders no row at all: "Real" (array index 1) is the
+    // only body row, and it maps to 1 — the note's index in the caller's array.
+    expect(rowBody(rows[1]!)).toBe("■ Real");
+    expect(noteAtRow).toEqual([null, 1, null]);
+  });
+
+  it("returns empty rows and mapping for empty or unusable notes", () => {
+    expect(railHeadsUpRows([], { width: 48 })).toEqual({ rows: [], noteAtRow: [] });
+    expect(railHeadsUpRows(undefined as unknown as Note[], { width: 48 })).toEqual({ rows: [], noteAtRow: [] });
+    expect(railHeadsUpRows("notes" as unknown as Note[], { width: 48 })).toEqual({ rows: [], noteAtRow: [] });
+  });
+
+  it("degrades to bare clamped rules below width 5 with an all-null mapping (nothing clickable)", () => {
+    const { rows, noteAtRow } = railHeadsUpRows([note()], { width: 4 });
+    expect(rows).toEqual([
+      { segments: [{ token: "border", text: "╭──╮" }] },
+      { segments: [{ token: "border", text: "╰──╯" }] },
+    ]);
+    expect(noteAtRow).toEqual([null, null]); // parallel to rows: every rule row is inert
   });
 });
 
@@ -473,6 +589,16 @@ describe("popupListRows", () => {
     const rows = popupListRows([note()], { width: 40.9 });
     for (const row of rows) expect(rowText(row)).toHaveLength(40);
   });
+
+  it("marks subagent-origin entries with a ' · subagent' suffix on their numbered line", () => {
+    const rows = popupListRows(
+      [note({ title: "Local" }), subagentNote({ severity: "warning", title: "Relayed" })],
+      { width: 60 },
+    );
+    expect(rowBody(rows[1]!)).toBe("1. [info] Local");
+    expect(rowBody(rows[2]!)).toBe("2. [warning] Relayed · subagent");
+    expect(rows[2]!.segments[1]?.token).toBe("warning"); // the entry keeps its severity color
+  });
 });
 
 describe("noteIndexAtPopupRow", () => {
@@ -597,6 +723,26 @@ describe("popupDetailRows", () => {
   it("falls back to the topic when the title is blank", () => {
     const rows = popupDetailRows(note({ title: "  ", topic: "t" }), { width: 40 });
     expect(rowBody(rows[1]!)).toBe("t");
+  });
+
+  it("inserts a muted 'via subagent · <basename>' row after the title block, absent for local notes", () => {
+    // Local note: no origin row (existing layout unchanged).
+    expect(popupDetailRows(note(), { width: 40 }).map(rowBody)).not.toContain(expect.stringContaining("via subagent"));
+
+    const rows = popupDetailRows(subagentNote(), { width: 40 });
+    expect(rows.map(rowBody)).toEqual(["✦ Heads up", "A title", "via subagent · ws", "", "Some detail", "", "1: Understood", "2: Chat in main session", "0: Dismiss", ""]);
+    expect(rows[2]!.segments[1]).toEqual({ token: "muted", text: "via subagent · ws" });
+  });
+
+  it("uses the last path segment across both separators, and just 'via subagent' without a usable cwd", () => {
+    const windows = popupDetailRows(subagentNote({ origin: { via: "subagent", cwd: "C:\\child\\ws\\" } }), { width: 40 });
+    expect(windows.map(rowBody)).toContain("via subagent · ws");
+
+    const emptyCwd = popupDetailRows(subagentNote({ origin: { via: "subagent" } }), { width: 40 });
+    expect(emptyCwd.map(rowBody)).toContain("via subagent");
+
+    const slashOnly = popupDetailRows(subagentNote({ origin: { via: "subagent", cwd: "/" } }), { width: 40 });
+    expect(slashOnly.map(rowBody)).toContain("via subagent");
   });
 
   it("returns [] for null/non-object notes or an unframeable width", () => {

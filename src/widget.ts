@@ -17,9 +17,10 @@
  * is the single source of truth for the detail-stage action keys and
  * labels.
  *
- * Contract: no terminal or theme imports, rows carry Severity | "muted"
- * tokens (card rows additionally carry "border" frame runs) for the caller
- * to theme via CardRow segments. The sidebar card truncates over-long text
+ * Contract: no terminal or theme imports, rows carry Severity | "muted" |
+ * "subagent" tokens (card rows additionally carry "border" frame runs; the
+ * "subagent" pseudo-severity marks relay-origin rows and themes as "muted")
+ * for the caller to theme via CardRow segments. The sidebar card truncates over-long text
  * (truncateLine); the popup stages instead WRAP (wrapLine) so the full note
  * brief is always visible — no ellipsis in any popup body row. The
  * hit-test helpers read the produced rows themselves — parsing each framed
@@ -38,11 +39,18 @@ import { type Note, type Severity } from "./notes.ts";
 /** Theme token used per severity or card-frame segment; applied via theme.fg(). */
 export type SeverityToken = "accent" | "warning" | "error" | "muted" | "border";
 
+/**
+ * A widget row/segment token: a severity, or one of the pseudo-severities —
+ * "muted" for de-emphasized rows, "subagent" for relay-origin rows (themed
+ * as "muted").
+ */
+export type RowToken = Severity | "muted" | "subagent";
+
 /** Pure severity/card-segment -> theme-token mapping (caller-side theming hook). */
-export function severityColorToken(severity: Severity | SeverityToken): SeverityToken {
+export function severityColorToken(severity: RowToken | SeverityToken): SeverityToken {
   if (severity === "warning") return "warning";
   if (severity === "critical") return "error";
-  if (severity === "muted") return "muted";
+  if (severity === "muted" || severity === "subagent") return "muted";
   if (severity === "border") return "border";
   return "accent";
 }
@@ -56,7 +64,7 @@ export function severityLabel(severity: Severity): string {
 
 /** One view-model row: its text plus the severity that should color it. */
 export interface WidgetLine {
-  severity: Severity | "muted";
+  severity: RowToken;
   text: string;
 }
 
@@ -84,6 +92,18 @@ function displayTitle(note: Note): string {
   return title.length > 0 ? title : note.topic;
 }
 
+/** Last segment of a path (either separator); empty for separator-only paths. */
+function pathBasename(path: string): string {
+  const parts = path.split(/[\\/]/).filter((part) => part.length > 0);
+  return parts.length > 0 ? parts[parts.length - 1]! : "";
+}
+
+/** Muted detail-stage provenance row: "via subagent · <basename>" ("via subagent" without a usable cwd). */
+function subagentOriginText(origin: { cwd?: string }): string {
+  const basename = typeof origin.cwd === "string" ? pathBasename(origin.cwd) : "";
+  return basename.length > 0 ? `via subagent · ${basename}` : "via subagent";
+}
+
 // ---------------------------------------------------------------------------
 // Sidebar + popup view models (ysk-sidebar). Pure: no terminal or theme
 // imports; rows carry Severity | "muted" tokens (the sidebar card adds
@@ -99,13 +119,13 @@ export interface SeverityTally {
   info: number;
 }
 
-/** What a sidebar row selects: the header covers all severities at once. */
-export type SidebarHit = "all" | Severity | null;
+/** What a sidebar row selects: the header covers all severities at once; "subagent" selects the relayed pool. */
+export type SidebarHit = "all" | Severity | "subagent" | null;
 
 /** One themed run of text inside a card row. */
 export interface CardSegment {
-  /** Theme token for this run: the row's severity, "muted", or "border" for frame runs. */
-  token: Severity | "muted" | "border";
+  /** Theme token for this run: the row's severity, a pseudo-severity ("muted"/"subagent"), or "border" for frame runs. */
+  token: RowToken | "border";
   /** Literal text; glyphs count as one cell each (the module's character convention). */
   text: string;
 }
@@ -142,6 +162,8 @@ const SIDEBAR_HEADER_PREFIX = "✦ ";
 const SIDEBAR_ROW_PREFIX = "■ ";
 /** Sidebar row order: highest priority severity first. */
 const SIDEBAR_SEVERITY_ORDER = ["critical", "warning", "info"] as const;
+/** Label of the sidebar's trailing relayed-notes row. */
+const SIDEBAR_SUBAGENT_LABEL = "subagent";
 /** Hint of the popup list stage. */
 const POPUP_LIST_HINT = "number to open · Esc to close";
 /** Title of every framed popup card (both stages). */
@@ -281,7 +303,8 @@ export function wrapLine(text: string, width: number): string[] {
  * input, means no sidebar: [].
  */
 export function sidebarCardRows(notes: Note[], options: { width: number }): CardRow[] {
-  const tally = tallyBySeverity(notes);
+  const list = Array.isArray(notes) ? notes : [];
+  const tally = tallyBySeverity(list);
   const total = tally.critical + tally.warning + tally.info;
   if (total === 0) return [];
 
@@ -290,6 +313,12 @@ export function sidebarCardRows(notes: Note[], options: { width: number }): Card
     const count = tally[severity];
     if (count > 0) body.push({ severity, text: `${SIDEBAR_ROW_PREFIX}${count} ${severityLabel(severity)}` });
   }
+  // One trailing pool row for relayed notes (the pool, not per severity):
+  // only when at least one pending note carries a subagent origin.
+  const subagentCount = list.filter((note) => note?.origin?.via === "subagent").length;
+  if (subagentCount > 0) {
+    body.push({ severity: "subagent", text: `${SIDEBAR_ROW_PREFIX}${subagentCount} ${SIDEBAR_SUBAGENT_LABEL}` });
+  }
   const unit = total === 1 ? "head-up" : "heads-up";
   return frameCardRows(body, `${SIDEBAR_HEADER_PREFIX}${total} ${unit}`, { width: cardWidth(options?.width) });
 }
@@ -297,7 +326,8 @@ export function sidebarCardRows(notes: Note[], options: { width: number }): Card
 /**
  * Resolve a 0-based component-local sidebar card line index to what it
  * selects: the top rule covers all severities ("all"), a body row its
- * middle segment's severity (info/warning/critical), and the bottom rule,
+ * middle segment's severity (info/warning/critical) or the "subagent"
+ * pool when that row carries the subagent token, and the bottom rule,
  * non-integer indices, and anything out of range select nothing (null).
  */
 export function severityAtSidebarCardRow(rows: CardRow[], y: number): SidebarHit {
@@ -305,6 +335,7 @@ export function severityAtSidebarCardRow(rows: CardRow[], y: number): SidebarHit
   if (y === 0) return "all";
   if (y === rows.length - 1) return null; // the bottom rule never selects
   const token = rows[y]!.segments[1]?.token;
+  if (token === "subagent") return "subagent";
   return token === "critical" || token === "warning" || token === "info" ? token : null;
 }
 
@@ -327,7 +358,8 @@ export function popupListRows(notes: Note[], options?: { width: number }): CardR
   const body: WidgetLine[] = [];
   list.forEach((note, index) => {
     if (note === null || typeof note !== "object") return; // skip garbage; numbering stays array-aligned
-    const line = `${index + 1}. [${severityLabel(note.severity)}] ${displayTitle(note)}`;
+    const suffix = note.origin?.via === "subagent" ? " · subagent" : "";
+    const line = `${index + 1}. [${severityLabel(note.severity)}] ${displayTitle(note)}${suffix}`;
     body.push(...wrappedLines({ severity: note.severity, text: line }, inner));
   });
   body.push(...wrappedLines({ severity: "muted", text: POPUP_LIST_HINT }, inner));
@@ -364,6 +396,10 @@ export function popupDetailRows(note: Note, options?: { width: number }): CardRo
   const inner = width - 4; // the frame eats "│ " + " │"
   // The full display title wraps (never truncates), keeping the note's severity.
   const body: WidgetLine[] = [...wrappedLines({ severity: note.severity, text: displayTitle(note) }, inner)];
+  // Relay provenance: a muted origin row between the title and the brief.
+  if (note.origin?.via === "subagent") {
+    body.push(...wrappedLines({ severity: "muted", text: subagentOriginText(note.origin) }, inner));
+  }
   body.push({ severity: "info", text: "" });
   const detail = typeof note.detail === "string" ? note.detail.trim() : "";
   if (detail.length > 0) {
@@ -397,6 +433,64 @@ export function popupActionAtRow(rows: CardRow[], y: number): PopupAction {
   if (!entry) return null;
   const action = POPUP_ACTIONS.find((candidate) => candidate.key === entry[1])?.action;
   return action ?? null;
+}
+
+/**
+ * A heads-up card shaped for gentle-pi's fullscreen rail: the framed rows
+ * plus, for every rendered row, the note that row belongs to.
+ */
+export interface RailHeadsUp {
+  /** The framed card rows: top rule, one wrapped row-group per note, bottom rule. */
+  rows: CardRow[];
+  /**
+   * Parallel to rows: the 0-based notes-array index a row belongs to, on the
+   * FIRST row of that note's wrapped group; null on frame rules, wrapped
+   * continuation rows, and skipped entries. The length always equals
+   * rows.length, so callers hit-test rendered rows by index directly.
+   */
+  noteAtRow: (number | null)[];
+}
+
+/**
+ * Rail variant of the heads-up card for gentle-pi's experimental fullscreen
+ * sidebar: the same rounded card as the other surfaces, but one row-group per
+ * NOTE instead of per-severity counts. Each valid note contributes a
+ * "■ <title>" row (display-title semantics: trimmed title falling back to the
+ * topic) colored with the note's severity, WRAPPED with the shared wrapper at
+ * the card's inner width (width - 4) — continuation rows keep the severity
+ * token and carry no prefix, so nothing is ever truncated and no ellipsis
+ * appears. Notes render IN ARRAY ORDER: newest-first display order is the
+ * caller's job (the wiring reverses the oldest-first store snapshot), and
+ * noteAtRow maps every rendered row to its note's 0-based array index (see
+ * RailHeadsUp). The rule title reads "✦ Heads up · <total>" with the total
+ * taken from the notes length as given. Empty or unusable notes input yields
+ * { rows: [], noteAtRow: [] }; widths below 5 degrade to the framer's bare
+ * rules with an all-null noteAtRow (nothing clickable); non-object entries
+ * are skipped without renumbering the surviving notes' indices.
+ */
+export function railHeadsUpRows(notes: Note[], options: { width: number }): RailHeadsUp {
+  const width = cardWidth(options?.width);
+  const list = Array.isArray(notes) ? notes : [];
+  if (list.length === 0) return { rows: [], noteAtRow: [] };
+
+  if (width < 5) {
+    const degenerate = frameCardRows([], `${POPUP_CARD_TITLE} · ${list.length}`, { width });
+    return { rows: degenerate, noteAtRow: degenerate.map(() => null) };
+  }
+
+  const inner = width - 4; // the frame eats "│ " + " │"
+  const body: WidgetLine[] = [];
+  const bodyNotes: (number | null)[] = [];
+  list.forEach((note, index) => {
+    if (note === null || typeof note !== "object") return; // skip garbage; indices stay array-aligned
+    const group = wrappedLines({ severity: note.severity, text: `${SIDEBAR_ROW_PREFIX}${displayTitle(note)}` }, inner);
+    for (const [offset, line] of group.entries()) {
+      body.push(line);
+      bodyNotes.push(offset === 0 ? index : null); // continuations stay unmapped
+    }
+  });
+  const rows = frameCardRows(body, `${POPUP_CARD_TITLE} · ${list.length}`, { width });
+  return { rows, noteAtRow: [null, ...bodyNotes, null] };
 }
 
 /** The selected card row, or undefined when rows/y are unusable. */

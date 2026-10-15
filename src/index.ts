@@ -20,6 +20,7 @@
  */
 
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type {
   AgentEndEvent,
   AgentSettledEvent,
@@ -31,18 +32,28 @@ import type {
   ToolExecutionEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import { DEFAULT_REVIEW_EVERY, loadConfig, loadPendingNotes, saveDismissed, savePendingNotes, type YskConfig } from "./config.ts";
+import {
+  DEFAULT_RELAY_MAX_AGE_HOURS,
+  DEFAULT_REVIEW_EVERY,
+  loadConfig,
+  loadPendingNotes,
+  saveDismissed,
+  savePendingNotes,
+  type YskConfig,
+} from "./config.ts";
 import { wireActions } from "./actions.ts";
 import { formatNotesForChat, NoteStore, type Note, type Severity } from "./notes.ts";
 import { buildDigest, runReviewer, type ReviewerRequest } from "./reviewer.ts";
 import { StepCounter } from "./steps.ts";
 import { registerHeadsUpTool } from "./tool.ts";
+import { RelayWatcher, RelayWriter, isSubagentChild, relayDirFor } from "./relay.ts";
 import {
   POPUP_ACTIONS,
   noteIndexAtPopupRow,
   popupActionAtRow,
   popupDetailRows,
   popupListRows,
+  railHeadsUpRows,
   severityAtSidebarCardRow,
   severityColorToken,
   sidebarCardRows,
@@ -50,10 +61,114 @@ import {
 } from "./widget.ts";
 
 const USER_CONFIG_PATH = "~/.pi/agent/you-should-know.json";
+
+// --- gentle-pi experimental fullscreen rail integration (best-effort) --------
+
+/**
+ * Gentle-pi's experimental fullscreen shell exposes a right-hand rail on the
+ * TUI's terminal object behind Symbol.for keys. These two string keys are the
+ * ONLY contract this extension relies on: they are never imported from
+ * gentle-pi, and any other internal (state shape, parts map, cache field) is
+ * read defensively so a gentle-pi internals change degrades silently to the
+ * regular tally overlay instead of throwing into the runtime.
+ */
+const GENTLE_RAIL_STATE = Symbol.for("gentle-pi.experimental-sidebar.state");
+/** Cache symbol whose `revision` counter invalidates the whole gentle rail. */
+const GENTLE_RAIL_CACHE = Symbol.for("gentle-pi.experimental-sidebar.cache");
+
+/** The key this extension registers its rail part under. */
+const RAIL_PART_KEY = "ysk";
+
+/** Structural view of one rail part; only these members are ever touched. */
+interface GentleRailComponent {
+  render: (width?: number) => string[];
+  digest?: () => string;
+  handleMouse?: (event: GentleMouseEvent) => unknown;
+  invalidate?: () => void;
+  dispose?: () => void;
+}
+
+/** Structural view of gentle-pi's experimental sidebar state on tui.terminal. */
+interface GentleRailStateLike {
+  active?: boolean;
+  ownsHost?: () => boolean;
+  parts?: Map<string, GentleRailComponent>;
+}
+
+/** The mouse event shape the rail part's hit-testing needs. */
+interface GentleMouseEvent {
+  type?: unknown;
+  button?: unknown;
+  y?: unknown;
+}
+
+/**
+ * Read gentle-pi's experimental sidebar state from a TUI, quietly. This is a
+ * best-effort integration with gentle-pi's EXPERIMENTAL sidebar internals:
+ * the Symbol.for keys above are the only contract, and every access is guarded
+ * so an absent state (plain pi, other runtimes) or changed internals simply
+ * return null and the extension degrades to its own overlay. Never throws.
+ */
+function gentleRailState(tui: unknown): GentleRailStateLike | null {
+  try {
+    const terminal = (tui as { terminal?: unknown } | null | undefined)?.terminal;
+    if (terminal === null || typeof terminal !== "object") return null;
+    const state = (terminal as Record<symbol, unknown>)[GENTLE_RAIL_STATE];
+    if (state === null || typeof state !== "object") return null;
+    if (!((state as GentleRailStateLike).parts instanceof Map)) return null;
+    return state as GentleRailStateLike;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bump gentle-pi's rail cache revision so the whole rail re-renders on the
+ * next frame. Quiet no-op when the cache symbol is absent or reshaped: note
+ * changes must re-render the rail even between digest revalidations, but a
+ * missing cache only costs freshness, never correctness. Never throws.
+ */
+function gentleRailInvalidate(tui: unknown): void {
+  try {
+    const terminal = (tui as { terminal?: unknown } | null | undefined)?.terminal;
+    if (terminal === null || typeof terminal !== "object") return;
+    const cache = (terminal as Record<symbol, unknown>)[GENTLE_RAIL_CACHE];
+    if (cache === null || typeof cache !== "object") return;
+    const revision = (cache as { revision?: unknown }).revision;
+    if (typeof revision !== "number") return;
+    (cache as { revision: number }).revision = revision + 1;
+  } catch {
+    // quiet: rail invalidation is best-effort
+  }
+}
+
+/**
+ * True when gentle-pi's fullscreen rail is active AND owns the host surface
+ * (fullscreen mode) for this TUI — the condition under which the tally
+ * overlay must paint nothing, because the rail renders the card instead.
+ * Anything absent, reshaped, or throwing reads as "not owning": the overlay
+ * keeps painting and the fallback stays intact. Never throws.
+ */
+function gentleRailOwnsHost(tui: unknown): boolean {
+  const state = gentleRailState(tui);
+  if (state === null || state.active !== true) return false;
+  try {
+    return state.ownsHost?.() === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Pending notes newest first (the popup list's and rail card's display order). */
+function newestFirst(notes: Note[]): Note[] {
+  return [...notes].reverse();
+}
+
 /**
  * Fallback row width for sidebar frames rendered without a width (tests, odd
- * terminals) — not the overlay size: the sidebar overlay spans the full
- * terminal width and every frame renders at the width pi-tui hands it.
+ * terminals) — not the overlay size: the compact right-edge overlay resolves
+ * to 30% of the terminal (min 24) and every frame renders at the width
+ * pi-tui hands it.
  */
 const SIDEBAR_FALLBACK_WIDTH = 26;
 /**
@@ -105,20 +220,32 @@ interface OverlayHandleLike {
   getBounds(): { row: number; col: number; width: number; height: number } | undefined;
 }
 
-/** What a popup shows: every pending note, one severity's notes, or one note. */
-type PopupTarget = Note | { all: true } | { severity: Severity };
+/** What a popup shows: every pending note, one severity's notes, the subagent pool, or one note. */
+type PopupTarget = Note | { all: true } | { severity: Severity } | { subagent: true };
 
 /** Popup component state: the list stage or the detail stage. */
 type PopupStage = { kind: "list"; notes: Note[] } | { kind: "detail"; note: Note };
 
 /** Default export: the extension factory (sync; no heavy work, no I/O). */
-export default function youShouldKnowExtension(pi: ExtensionAPI): void {
+export default function youShouldKnowExtension(
+  pi: ExtensionAPI,
+  overrides: { env?: NodeJS.ProcessEnv; relayDir?: string } = {},
+): void {
+  // Relay environment: tests inject a fake env (and a tmp relay dir) so the
+  // real process env and agent home are never touched.
+  const relayEnv = overrides.env ?? process.env;
+
   // --- session state -------------------------------------------------------
   // One store/counter per extension runtime. The store instance stays stable
   // so the tool and command registrations keep working across session
   // replacement; its contents are reset on every session_start.
   let ctxRef: ExtensionContext | null = null;
-  let sessionConfig: YskConfig = { reviewEvery: DEFAULT_REVIEW_EVERY, dismissedTopics: [] };
+    let sessionConfig: YskConfig = {
+      reviewEvery: DEFAULT_REVIEW_EVERY,
+      subagentRelay: true,
+      subagentRelayMaxAgeHours: DEFAULT_RELAY_MAX_AGE_HOURS,
+      dismissedTopics: [],
+    };
   let projectConfigPath: string | undefined;
   let projectNotesPath: string | undefined;
   let counter = new StepCounter();
@@ -133,6 +260,13 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   // on session_start/session_shutdown.
   let agentActive = false;
   let renderDirty = false;
+  // Subagent relay endpoints (session-scoped). Exactly one is live at a
+  // time: the child writer when this process is a gentle-pi subagent, the
+  // parent watcher otherwise — both null while the relay is disabled or no
+  // session has started. The writer is captured by the store's onAdd hook
+  // below, so session replacement swaps it by reassigning this field.
+  let relayWriter: RelayWriter | null = null;
+  let relayWatcher: RelayWatcher | null = null;
   // Tally sidebar overlay state (session-scoped). sidebarDone is pi's own
   // done callback captured inside the custom() factory: resolving it closes
   // and disposes the overlay, so the empty-snapshot path closes through pi
@@ -144,6 +278,12 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   let sidebarHandle: OverlayHandleLike | null = null;
   let sessionTui: { requestRender: (force?: boolean) => void } | null = null;
   let sidebarNotes: Note[] = [];
+  // Gentle-pi fullscreen-rail state (session-scoped). The widget factory
+  // captures the TUI whose gentle rail hosts the "ysk" part and flags the
+  // connection, so note changes can bump the rail's cache revision. Both stay
+  // unset until pi actually invokes the factory (and reset at session ends).
+  let railTui: unknown = null;
+  let railHostConnected = false;
   // Note popup overlay state (session-scoped, same done-capture pattern).
   // One popup at a time: opening a new one closes the previous first.
   let popupDone: ((value: unknown) => void) | null = null;
@@ -152,8 +292,15 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   // Persistence is injected, not owned by the store: pending-note writes
   // funnel through persistNotes below (one serialized chain), while the
   // permanent-dismissal list flows through the /ysk ActionDeps (`persist`
-  // below), the single dismissed write path.
-  const store = new NoteStore({ persistPending: (notes) => persistNotes(notes) });
+  // below), the single dismissed write path. onAdd mirrors every real add
+  // into the relay writer (when this process is a subagent child); the hook
+  // lives on the factory-scoped store so it survives session replacement.
+  const store = new NoteStore({
+    persistPending: (notes) => persistNotes(notes),
+    onAdd: (note) => {
+      relayWriter?.enqueue(note);
+    },
+  });
 
   // --- gated overlay rendering ---------------------------------------------
 
@@ -162,6 +309,8 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
    * render request (reviewer note arrival, heads_up additions, dismissals,
    * /ysk actions) only marks the sidebar dirty; the loop-boundary handlers
    * flush it. When idle, renders behave exactly as before: immediate write.
+   * Either way the gentle fullscreen rail (when connected) is invalidated so
+   * the docked card tracks note changes even between digest revalidations.
    */
   function requestRender(ctx: ExtensionContext | null): void {
     if (agentActive) {
@@ -169,6 +318,22 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       return;
     }
     writeSidebar(ctx);
+    invalidateRail();
+  }
+
+  /**
+   * Bump the gentle rail's cache revision so a registered "ysk" part
+   * repaints on the next frame. Quiet no-op until the widget factory has
+   * connected to a gentle rail (and entirely without one). Best-effort:
+   * failures are swallowed and never reach the runtime.
+   */
+  function invalidateRail(): void {
+    if (!railHostConnected) return;
+    try {
+      gentleRailInvalidate(railTui);
+    } catch {
+      // quiet: rail invalidation must never reach the runtime
+    }
   }
 
   // --- tally sidebar overlay ------------------------------------------------
@@ -186,7 +351,14 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     if (!ctx) return;
     try {
       if (!ctx.hasUI || ctx.mode !== "tui") return;
+      const previous = sidebarNotes;
       sidebarNotes = [...store.pending];
+      // A changed snapshot must re-render the gentle rail even between
+      // digest revalidations; reference equality is enough (notes are
+      // immutable, and store.pending returns a fresh defensive copy).
+      if (previous.length !== sidebarNotes.length || previous.some((note, index) => note !== sidebarNotes[index])) {
+        invalidateRail();
+      }
       if (sidebarNotes.length === 0) {
         // Empty tally and an open overlay: close it through pi's own done
         // (resolved + disposed by pi) and drop the handle so nothing stale
@@ -259,12 +431,13 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
             // has been drawn yet, derive them from the event's own width.
             if (sidebarFrameRows.length === 0) sidebarFrameRows = frameRows(event?.width);
             // Click routing: the card rows decide what a click selects
-            // (title -> all, a body row's middle segment -> its severity).
-            // The overlay is nonCapturing, so opening the popup never steals
-            // focus from the editor beforehand — the popup captures its own.
+            // (title -> all, a body row's middle segment -> its severity,
+            // the pool row -> the subagent filter). The overlay is
+            // nonCapturing, so opening the popup never steals focus from
+            // the editor beforehand — the popup captures its own.
             const hit = severityAtSidebarCardRow(sidebarFrameRows, event.y);
             if (hit === null) return undefined;
-            openPopup(hit === "all" ? { all: true } : { severity: hit });
+            openPopup(hit === "all" ? { all: true } : hit === "subagent" ? { subagent: true } : { severity: hit });
             return { handled: true };
           },
         };
@@ -375,7 +548,9 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
         ? store.pending
         : "topic" in (target as Note)
           ? [target as Note]
-          : store.pending.filter((note) => note.severity === (target as { severity: Severity }).severity);
+          : (target as { subagent?: true }).subagent === true
+            ? store.pending.filter((note) => note.origin?.via === "subagent")
+            : store.pending.filter((note) => note.severity === (target as { severity: Severity }).severity);
     // List stage reads newest first; a single note is unaffected by the flip.
     const notes = [...matches].reverse();
     if (notes.length === 0) return;
@@ -507,7 +682,12 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       projectNotesPath = join(cwd, ".pi", "you-should-know-notes.json");
       sessionConfig = await loadConfig(projectConfigPath, USER_CONFIG_PATH);
     } catch {
-      sessionConfig = { reviewEvery: DEFAULT_REVIEW_EVERY, dismissedTopics: [] };
+      sessionConfig = {
+        reviewEvery: DEFAULT_REVIEW_EVERY,
+        subagentRelay: true,
+        subagentRelayMaxAgeHours: DEFAULT_RELAY_MAX_AGE_HOURS,
+        dismissedTopics: [],
+      };
     }
     if (gen !== generation) return; // session replaced or shut down while loading
 
@@ -532,7 +712,70 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       if (!store.isDismissed(topic)) store.dismissPermanently(topic);
     }
     store.replacePending(persisted.filter((note) => !store.isDismissed(note.topic)));
+    setupRelay(ctx);
     requestRender(ctx);
+  }
+
+  /** Best-effort sessionManager read: a missing/throwing manager falls back. */
+  function sessionManagerValue(read: () => string | undefined, fallback: () => string): string {
+    try {
+      const value = read();
+      return typeof value === "string" && value.length > 0 ? value : fallback();
+    } catch {
+      return fallback();
+    }
+  }
+
+  /**
+   * (Re)arm the subagent relay for this session. Exactly one endpoint lives
+   * at a time: a gentle-pi subagent child gets a RelayWriter (its real adds
+   * mirror out through the store's onAdd hook), everyone else gets a
+   * RelayWatcher ingesting child notes into the store; the relay off switch
+   * arms neither. Called on every session_start AFTER the pending reseed so
+   * ingested adds can never race the restore's clear-then-replace pair, and
+   * it tears down the replaced session's watcher first. Every failure stays
+   * quiet: a broken relay must never break session_start.
+   */
+  function setupRelay(ctx: ExtensionContext): void {
+    try {
+      relayWatcher?.close(); // session replacement: stop the previous watcher first
+    } catch {
+      // quiet: teardown is best-effort
+    }
+    relayWatcher = null;
+    relayWriter = null;
+    if (!sessionConfig.subagentRelay) return;
+    const dir = overrides.relayDir ?? relayDirFor(relayEnv);
+    if (isSubagentChild(relayEnv)) {
+      const sessionId = sessionManagerValue(
+        () => ctx.sessionManager.getSessionId(),
+        () => randomUUID(),
+      );
+      const cwd = sessionManagerValue(
+        () => ctx.sessionManager.getCwd(),
+        () => (typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd()),
+      );
+      relayWriter = new RelayWriter({ dir, sessionId, cwd });
+    } else {
+      const gen = generation;
+      relayWatcher = new RelayWatcher({
+        dir,
+        maxAgeMs: sessionConfig.subagentRelayMaxAgeHours * 3600 * 1000,
+        ingest: (note) => {
+          try {
+            // Generation guard: a watcher outliving its session never
+            // touches the new session's store (close() makes this rare).
+            if (gen !== generation || !ctxRef) return;
+            if (store.isDismissed(note.topic)) return;
+            store.add(note);
+            requestRender(ctxRef);
+          } catch {
+            // quiet: ingest is best-effort and must never reach the runtime
+          }
+        },
+      });
+      void relayWatcher.start(); // fire-and-forget: the initial scan lands when it lands
+    }
   }
 
   pi.on("session_shutdown", (_event: SessionShutdownEvent, _ctx: ExtensionContext) => {
@@ -548,6 +791,13 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     renderDirty = false;
     resetSidebar();
     closePopup();
+    try {
+      relayWatcher?.close(); // stop event-triggered rescans; scanNow dies with the watcher reference
+    } catch {
+      // quiet: watcher teardown is best-effort
+    }
+    relayWatcher = null;
+    relayWriter = null;
     ctxRef = null;
   });
 
@@ -755,7 +1005,26 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
       `review in flight: ${inFlight ? "yes" : "no"}`,
       `pending notes: ${store.pending.length}`,
       `dismissed topics (permanent): ${store.dismissedTopics.length}`,
+      relayStatusLine(),
     ].join("\n");
+  }
+
+  /**
+   * The relay's one-line /ysk status: what the child writes to, what the
+   * parent has ingested, or "off". Failures stay quiet per the module style.
+   */
+  function relayStatusLine(): string {
+    try {
+      if (relayWriter !== null) {
+        return `subagent relay: writing to ${relayWriter.file}`;
+      }
+      if (relayWatcher !== null) {
+        return `subagent relay: on · ingested ${relayWatcher.stats().ingested} notes`;
+      }
+    } catch {
+      // quiet: status must never throw
+    }
+    return "subagent relay: off";
   }
 
   // --- registrations ---------------------------------------------------------
