@@ -1,6 +1,6 @@
 # Feature: ysk-subagent-relay (surface subagent heads-ups on the parent)
 
-Status: in_progress
+Status: complete
 Branch: feature/you-should-know (continues after ysk-sidebar)
 Created: 2026-10-15
 Engram mirror: not created (no memory tools callable in this session)
@@ -84,4 +84,16 @@ internal); the relay is a pool, not per-card rows.
 
 ## Evidence
 
-(commit hashes recorded per task as they land)
+| Unit | Commit | Content |
+| --- | --- | --- |
+| Transport + foundations | ae662f8 | src/relay.ts (convention, RelayWriter, RelayWatcher), Note.origin, onAdd hook, config keys; relay/notes/config tests + relay wiring-test hunks + README relay section |
+| Parent surface + wiring | a30b9f9 | index.ts endpoints (child writer / parent watcher, shutdown teardown), widget provenance (pool row, list/detail markers, chat suffix), /ysk status line, widget tests, feature doc |
+
+Verification (independent gentle-ai-verify run, 2026-10-15): `npm test` 259 passed /
+9 failed — the 9 are the concurrent T9 fullscreen-rail RED tests (different feature,
+red-first TDD by session 01a13c1c; intentionally excluded from both commits), zero
+relay failures; `npm run typecheck` clean; read-only spot-check of writer/watcher
+cursors, age window, GC, and ingest-dismissal guard found no defects.
+
+Note: tests/wiring.test.ts, README.md, and odd/tasks/ysk-sidebar.md still hold the
+uncommitted T9 hunks in the working tree, owned by the concurrent session.
