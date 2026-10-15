@@ -120,6 +120,107 @@ describe("NoteStore dismissal flows", () => {
   });
 });
 
+describe("NoteStore persistPending", () => {
+  it("fires once with the exact pending list after an add", () => {
+    const persist = vi.fn();
+    const store = new NoteStore({ persistPending: persist });
+    store.add(note("one"));
+    store.add(note("two"));
+    expect(persist).toHaveBeenCalledTimes(2);
+    expect(persist).toHaveBeenLastCalledWith([note("one"), note("two")]);
+  });
+
+  it("does not fire for a duplicate add", () => {
+    const persist = vi.fn();
+    const store = new NoteStore({ persistPending: persist });
+    expect(store.add(note("API Keys"))).toBe(true);
+    expect(store.add(note("api   keys", "warning", "Different title"))).toBe(false);
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist).toHaveBeenCalledWith([note("API Keys")]);
+  });
+
+  it("fires with the remaining list only when dismissSession removes something", () => {
+    const persist = vi.fn();
+    const store = new NoteStore({ persistPending: persist });
+    store.add(note("one"));
+    store.add(note("two"));
+    persist.mockClear();
+
+    expect(store.dismissSession("unknown")).toBe(false);
+    expect(persist).not.toHaveBeenCalled();
+
+    expect(store.dismissSession("  ONE  ")).toBe(true);
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist).toHaveBeenCalledWith([note("two")]);
+  });
+
+  it("fires once with the final deduped list after replacePending", () => {
+    const persist = vi.fn();
+    const store = new NoteStore({ persistPending: persist });
+    store.replacePending([note("a"), note("A", "warning"), note("b"), note("c"), note("d")]);
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist).toHaveBeenCalledWith([note("b"), note("c"), note("d")]);
+  });
+
+  it("does not fire for a replacePending that leaves the pending list unchanged", () => {
+    const persist = vi.fn();
+    const store = new NoteStore({ persistPending: persist });
+    store.add(note("one"));
+    store.clearPending();
+    persist.mockClear();
+
+    store.replacePending([]); // empty -> empty: no-op, no fire
+    store.replacePending([note("one")]); // real change: fires
+    store.replacePending([note("ONE")]); // identical by topic: no-op, no fire
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist).toHaveBeenCalledWith([note("one")]);
+    expect(store.pending).toEqual([note("ONE")]);
+  });
+
+  it("fires for clearPending only when items were non-empty", () => {
+    const persist = vi.fn();
+    const store = new NoteStore({ persistPending: persist });
+    store.clearPending(); // empty store: no-op, no fire
+    expect(persist).not.toHaveBeenCalled();
+
+    store.add(note("one"));
+    persist.mockClear();
+    store.clearPending();
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist).toHaveBeenCalledWith([]);
+
+    store.clearPending();
+    expect(persist).toHaveBeenCalledTimes(1); // already empty: no second fire
+  });
+
+  it("fires for dismissPermanently with the remaining pending list, alongside persistDismissed", () => {
+    const persist = vi.fn();
+    const persistDismissed = vi.fn();
+    const store = new NoteStore({ persistPending: persist, persistDismissed });
+    store.add(note("one"));
+    store.add(note("two"));
+    persist.mockClear();
+
+    store.dismissPermanently("ONE");
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist).toHaveBeenCalledWith([note("two")]);
+    expect(persistDismissed).toHaveBeenCalledWith(["one"]);
+    expect(store.pending.map((n) => n.topic)).toEqual(["two"]);
+  });
+
+  it("works without a persistPending callback (option is optional)", () => {
+    const store = new NoteStore();
+    expect(() => {
+      store.add(note("one"));
+      store.dismissSession("one");
+      store.clearPending();
+      store.replacePending([note("two")]);
+      store.dismissPermanently("two");
+    }).not.toThrow();
+    expect(store.pending).toHaveLength(0);
+  });
+});
+
 describe("formatNotesForChat", () => {
   it("formats one or more notes as a chat message", () => {
     const text = formatNotesForChat([

@@ -136,6 +136,23 @@ red first. Acceptance: no "…" in any popup body row; both stages framed at exa
 overlay width; click/keyboard routing preserved; suite + tsc green. Known cap:
 maxHeight still bounds height (pi-tui slices overflow; scrolling stays a non-goal).
 
+### T8. Persist pending notes across restarts (user-requested 2026-10-15)
+Product decision (user): pending heads-up notes survive closing/reloading pi.
+Pending notes persist per-project in `<cwd>/.pi/you-should-know-notes.json`
+(`{ "notes": [...] }`, oldest first); processed (Understood/Chat), Dismiss, and
+permanent dismissals still leave the pending store, so they are NOT restored after a
+reload (permanent dismissals keep blocking re-raising via the existing config).
+Mechanics: config.ts `loadPendingNotes`/`savePendingNotes` (defensive validation:
+object entries, non-empty topic, coerceSeverity, string title/detail; corrupt/missing
+-> []); NoteStore gains a `persistPending?: (notes: Note[]) => void` option fired
+once per public pending mutation (add, replacePending, dismissSession, clearPending,
+dismissPermanently), mirroring persistDismissed; index.ts funnels writes through a
+serialized promise chain (the clearPending-then-replace race in initSession must
+never reorder), loads on session_start (skipping permanently dismissed topics,
+generation-guarded), best-effort quiet failures throughout. README documents the
+state file and semantics. Tests red first. Acceptance: notes file round-trips;
+reload restores the tally; corrupt file degrades to empty; suite + tsc green.
+
 ## Evidence
 
 | Task | Commit | Result |
@@ -147,4 +164,5 @@ maxHeight still bounds height (pi-tui slices overflow; scrolling stays a non-goa
 | Native review | lineage: NONE — blocked | START over committed range b742e691..HEAD rejected 3x: controller returns empty-candidate workspace status (empty_candidate_base_ref_required) without creating a lineage; untracked selection (.pi/you-should-know.json) resolved via select-intended-untracked; START loop stopped per contract. No authority created or burned. Feature otherwise verified (168/168, tsc clean, API cross-check, adversarial sweep clean). Retry in a fresh session or via maintainer CLI. |
 | T5 card restyle | adece77 | gentle-ai-worker TDD (red -> green), gentle-ai-verify PASS (geometry matches gentle-pi shell-card arithmetic; popup untouched); degenerate-width coverage gap closed by parent; 169/169 green, tsc clean |
 | T6 full width | 303c77c | overlay width "100%" (pi-tui clamps to terminal - margins, passes resolved width to render); notes snapshot + per-frame card at render width, frame-rows hit-test cache (popup pattern); dynamic-width test at 40/100; gentle-ai-verify PASS; 170/170 green, tsc clean |
-| T7 popup card | (this commit) | shared frameCardRows framer (sidebar delegates, tests unmodified as parity net) + wrapLine (hard-break, no ellipsis); popup both stages framed "✦ Heads up" cards at 80%/80%, bodies pre-wrapped at width-4; hit-tests on framed body text, action block above bottom rule; popupRowWidth drops 0.6 re-ratio; gentle-ai-verify PASS; 188/188 green, tsc clean; cap noted: maxHeight still bounds height (scrolling stays non-goal) |
+| T7 popup card | ee4979a | shared frameCardRows framer (sidebar delegates, tests unmodified as parity net) + wrapLine (hard-break, no ellipsis); popup both stages framed "✦ Heads up" cards at 80%/80%, bodies pre-wrapped at width-4; hit-tests on framed body text, action block above bottom rule; popupRowWidth drops 0.6 re-ratio; gentle-ai-verify PASS; 188/188 green, tsc clean; cap noted: maxHeight still bounds height (scrolling stays non-goal) |
+| T8 persistence | (this commit) | config loadPendingNotes/savePendingNotes + NoteStore persistPending callback + serialized notesWriteChain; wiring + README; round-1 gentle-ai-verify FAIL caught a real initSession write/read race (reseed fired empty writes before the off-chain read -> restarts with dismissedTopics could wipe the file); fixed load-before-mutate + flushPendingNoteWrites test drain + regression pin; flagged replacePending change-guard accepted (keeps pristine projects quiet); parent unit pin for the no-op guards; 211/211 green x3, tsc clean |

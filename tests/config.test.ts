@@ -1,9 +1,17 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { DEFAULT_REVIEW_EVERY, expandTildePath, loadConfig, saveDismissed } from "../src/config.ts";
+import {
+  DEFAULT_REVIEW_EVERY,
+  expandTildePath,
+  loadConfig,
+  loadPendingNotes,
+  saveDismissed,
+  savePendingNotes,
+} from "../src/config.ts";
+import type { Note } from "../src/notes.ts";
 
 const fakeHome = vi.hoisted(() => `/tmp/ysk-config-test-home-${process.pid}`);
 
@@ -150,5 +158,90 @@ describe("saveDismissed", () => {
     await saveDismissed(project, ["two"]);
     const config = await loadConfig(project, undefined);
     expect(config.dismissedTopics).toEqual(["two"]);
+  });
+});
+
+describe("loadPendingNotes", () => {
+  it("returns [] when the file is missing, corrupt, or not an object", async () => {
+    expect(await loadPendingNotes(join(root, "nope", "missing.json"))).toEqual([]);
+
+    const corrupt = join(root, "notes-corrupt.json");
+    writeFileSync(corrupt, "{ not json", "utf8");
+    expect(await loadPendingNotes(corrupt)).toEqual([]);
+
+    const array = join(root, "notes-array.json");
+    writeFileSync(array, "[]", "utf8");
+    expect(await loadPendingNotes(array)).toEqual([]);
+  });
+
+  it("skips undefined paths", async () => {
+    expect(await loadPendingNotes(undefined)).toEqual([]);
+  });
+
+  it("round-trips notes saved by savePendingNotes, preserving order and fields", async () => {
+    const path = join(root, "notes-roundtrip.json");
+    const notes: Note[] = [
+      { topic: "api keys", severity: "critical", title: "Hardcoded keys", detail: "src/config.ts:12" },
+      { topic: "naming", severity: "warning", title: "Naming drift", detail: "" },
+    ];
+    await savePendingNotes(path, notes);
+    expect(await loadPendingNotes(path)).toEqual(notes);
+  });
+
+  it("filters and coerces invalid entries defensively", async () => {
+    const path = join(root, "notes-defensive.json");
+    writeJson(path, {
+      notes: [
+        { topic: "api keys", severity: "critical", title: "Keep", detail: "kept" },
+        { severity: "critical", title: "No topic" }, // dropped: topic missing
+        { topic: "   ", severity: "info", title: "Blank topic" }, // dropped: topic empty after normalize
+        "not an object", // dropped: not an object
+        null, // dropped: null entry
+        { topic: "Bad Severity", severity: "nope", title: "Coerced" }, // severity falls back to info
+        { topic: "  Mixed   Case  ", severity: "warning" }, // topic normalized, title/detail default ""
+      ],
+    });
+    expect(await loadPendingNotes(path)).toEqual([
+      { topic: "api keys", severity: "critical", title: "Keep", detail: "kept" },
+      { topic: "bad severity", severity: "info", title: "Coerced", detail: "" },
+      { topic: "mixed case", severity: "warning", title: "", detail: "" },
+    ]);
+  });
+
+  it("treats a missing or non-array notes field as empty", async () => {
+    const path = join(root, "notes-bad-field.json");
+    writeJson(path, { notes: "nope", dismissedTopics: ["unrelated"] });
+    expect(await loadPendingNotes(path)).toEqual([]);
+  });
+
+  it("expands ~ in paths", async () => {
+    const note: Note = { topic: "home topic", severity: "info", title: "", detail: "" };
+    await savePendingNotes("~/ysk-home-notes.json", [note]);
+    expect(await loadPendingNotes("~/ysk-home-notes.json")).toEqual([note]);
+  });
+});
+
+describe("savePendingNotes", () => {
+  it("writes pretty JSON with a trailing newline, creating parent dirs", async () => {
+    const path = join(root, "fresh", "nested", "pending.json");
+    await savePendingNotes(path, [{ topic: "timeouts", severity: "warning", title: "T", detail: "D" }]);
+    const text = await readFile(path, "utf8");
+    expect(text.endsWith("\n")).toBe(true);
+    expect(JSON.parse(text)).toEqual({
+      notes: [{ topic: "timeouts", severity: "warning", title: "T", detail: "D" }],
+    });
+  });
+
+  it("overwrites a previous save wholesale and tolerates a corrupt file", async () => {
+    const path = join(root, "pending-overwrite.json");
+    writeFileSync(path, "{ not json", "utf8");
+    await savePendingNotes(path, [{ topic: "two", severity: "info", title: "", detail: "" }]);
+    expect((await loadPendingNotes(path)).map((n) => n.topic)).toEqual(["two"]);
+  });
+
+  it("quietly skips non-string or empty paths", async () => {
+    await expect(savePendingNotes(undefined as unknown as string, [])).resolves.toBeUndefined();
+    await expect(savePendingNotes("", [])).resolves.toBeUndefined();
+    expect(existsSync(join(fakeHome, "undefined"))).toBe(false);
   });
 });

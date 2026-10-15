@@ -1,14 +1,15 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import youShouldKnowExtension from "../src/index.ts";
+import youShouldKnowExtension, { flushPendingNoteWrites } from "../src/index.ts";
 
 // --- fixtures --------------------------------------------------------------
 
 const FIXTURES = mkdtempSync(join(tmpdir(), "ysk-wiring-"));
 const CWD = join(FIXTURES, "ws");
 const PROJECT_CONFIG = join(CWD, ".pi", "you-should-know.json");
+const PROJECT_NOTES = join(CWD, ".pi", "you-should-know-notes.json");
 afterAll(() => {
   rmSync(FIXTURES, { recursive: true, force: true });
 });
@@ -16,6 +17,16 @@ afterAll(() => {
 function writeProjectConfig(config: Record<string, unknown>): void {
   mkdirSync(join(CWD, ".pi"), { recursive: true });
   writeFileSync(PROJECT_CONFIG, JSON.stringify(config), "utf8");
+}
+
+/**
+ * Seed the per-project pending-notes state file. An array seeds
+ * `{ notes: [...] }`; a string seeds raw file content (corrupt fixtures).
+ */
+function writePendingNotes(notes: unknown[] | string): void {
+  mkdirSync(join(CWD, ".pi"), { recursive: true });
+  const text = typeof notes === "string" ? notes : JSON.stringify({ notes });
+  writeFileSync(PROJECT_NOTES, text, "utf8");
 }
 
 const readProjectConfig = (): Record<string, unknown> => JSON.parse(readFileSync(PROJECT_CONFIG, "utf8"));
@@ -140,12 +151,21 @@ function mockCtx(
 async function setup(
   options: {
     config?: Record<string, unknown>;
+    notes?: unknown[] | string;
     hasUI?: boolean;
     outcome?: StreamOutcome;
     ctxOverrides?: Record<string, unknown>;
   } = {},
 ) {
   writeProjectConfig(options.config ?? {});
+  // Deterministic baseline: a previous test's fire-and-forget notes write
+  // may still be in flight, so drain the serialized write chain (a blind
+  // timeout cannot) before removing the state file — otherwise the stale
+  // write would land after the removal and leak notes into this session's
+  // restore.
+  await flushPendingNoteWrites();
+  if (options.notes === undefined) rmSync(PROJECT_NOTES, { force: true });
+  else writePendingNotes(options.notes);
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const handlers = new Map<string, Handler[]>();
@@ -953,5 +973,82 @@ describe("you-should-know note popup", () => {
       `<border>│ <muted>0: Dismiss<border>${" ".repeat(86)} │`,
       `<border>╰${"─".repeat(98)}╯`,
     ]);
+  });
+});
+
+// --- pending-note persistence (T8) ----------------------------------------------
+
+describe("you-should-know pending-note persistence", () => {
+  const PERSISTED_NOTES = [
+    { topic: "silent assumption", severity: "warning", title: "Silent assumption", detail: "detail a" },
+    { topic: "hidden decision", severity: "critical", title: "Hidden decision", detail: "detail b" },
+  ];
+
+  it("restores seeded pending notes into the sidebar tally on session_start", async () => {
+    const { ui, customCalls } = await setup({ notes: PERSISTED_NOTES });
+    expect(ui.custom).toHaveBeenCalledOnce(); // the tally opens with the restored notes
+    const text = renderOf(customCalls[0]!);
+    expect(text).toContain("2 heads-up");
+    expect(text).toContain("1 critical");
+    expect(text).toContain("1 warning");
+  });
+
+  it("filters permanently dismissed topics out of the restore", async () => {
+    const { ui, customCalls } = await setup({
+      config: { dismissedTopics: ["hidden decision"] },
+      notes: PERSISTED_NOTES,
+    });
+    expect(ui.custom).toHaveBeenCalledOnce();
+    const text = renderOf(customCalls[0]!);
+    expect(text).toContain("1 head-up");
+    expect(text).toContain("1 warning");
+    expect(text).not.toContain("critical");
+  });
+
+  it("restores live seeded notes even when the project config lists dismissed topics (load-before-mutate)", async () => {
+    // Regression pin for the confirmed initSession race: the reseed's
+    // persistPending writes used to be enqueued BEFORE the state-file read
+    // and could win it, so the restore saw an empty file and wiped the
+    // persisted notes. Dismissed topics that match nothing must never stop
+    // the live notes from being restored.
+    const { ui, customCalls } = await setup({
+      config: { dismissedTopics: ["unrelated topic", "another mismatch"] },
+      notes: PERSISTED_NOTES,
+    });
+    expect(ui.custom).toHaveBeenCalledOnce();
+    const text = renderOf(customCalls[0]!);
+    expect(text).toContain("2 heads-up");
+    expect(text).toContain("1 critical");
+    expect(text).toContain("1 warning");
+  });
+
+  it("degrades a corrupt notes file to an empty tally without breaking session_start", async () => {
+    const { ui, customCalls, tools, handlers, ctx } = await setup({ notes: "{ not json" });
+    expect(ui.custom).not.toHaveBeenCalled(); // nothing restored, nothing shown
+
+    // The extension keeps working normally afterwards.
+    await addNoteViaTool(tools, "Fresh note");
+    handlers.get("tool_execution_end")![0](toolEndEvent("corrupt-1"), ctx);
+    expect(ui.custom).toHaveBeenCalledOnce();
+    expect(renderOf(customCalls[0]!)).toContain("1 head-up");
+  });
+
+  it("processing a note (Understood) rewrites the file without it", async () => {
+    const { ctx, commands, customCalls } = await setup({ notes: PERSISTED_NOTES });
+    await commands.get("ysk").handler("", ctx); // popup over all notes, newest first
+    customCalls[1]!.component.handleInput!("1"); // detail: "Hidden decision"
+    customCalls[1]!.component.handleInput!("1"); // Understood
+    await flushPendingNoteWrites(); // the rewrite flows through the serialized chain
+    const onDisk = JSON.parse(readFileSync(PROJECT_NOTES, "utf8")) as { notes: Array<{ topic: string }> };
+    expect(onDisk.notes.map((note) => note.topic)).toEqual(["silent assumption"]);
+  });
+
+  it("stays quiet when the notes file is absent: nothing is written for a fresh project", async () => {
+    const { ui } = await setup();
+    expect(ui.custom).not.toHaveBeenCalled();
+    // Assert absence only after every write enqueued by session_start has
+    // landed — a fresh project must not create the file at all.
+    await flushPendingNoteWrites();
+    expect(existsSync(PROJECT_NOTES)).toBe(false);
   });
 });

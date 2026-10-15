@@ -31,7 +31,7 @@ import type {
   ToolExecutionEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import { DEFAULT_REVIEW_EVERY, loadConfig, saveDismissed, type YskConfig } from "./config.ts";
+import { DEFAULT_REVIEW_EVERY, loadConfig, loadPendingNotes, saveDismissed, savePendingNotes, type YskConfig } from "./config.ts";
 import { wireActions } from "./actions.ts";
 import { formatNotesForChat, NoteStore, type Note, type Severity } from "./notes.ts";
 import { buildDigest, runReviewer, type ReviewerRequest } from "./reviewer.ts";
@@ -62,6 +62,28 @@ const SIDEBAR_FALLBACK_WIDTH = 26;
  * terminal and every frame renders at the width pi-tui hands it.
  */
 const POPUP_WIDTH_MIN = 40;
+
+/**
+ * Serialized write chain for the per-project pending-notes file. Every
+ * pending-note mutation funnels its save through this chain, so writes from
+ * concurrent fire-and-forget flows land strictly in mutation order and the
+ * most recent pending list is always what reaches the disk — an older write
+ * can never land last and wipe newer state. initSession reads the file
+ * before its first store mutation, so no chain write can race that read.
+ * Failures are swallowed per link; the chain itself never rejects.
+ */
+let notesWriteChain: Promise<void> = Promise.resolve();
+
+/**
+ * Test-isolation drain for the serialized pending-notes write chain:
+ * resolves once every write enqueued so far has settled, in chain order.
+ * Each link swallows its own failures, so this never rejects. The extension
+ * never calls this at runtime; wiring tests use it to observe the notes
+ * file only after its writes have actually landed.
+ */
+export async function flushPendingNoteWrites(): Promise<void> {
+  await notesWriteChain;
+}
 
 /**
  * The streamSimple adapter surface, derived structurally from the installed
@@ -98,6 +120,7 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   let ctxRef: ExtensionContext | null = null;
   let sessionConfig: YskConfig = { reviewEvery: DEFAULT_REVIEW_EVERY, dismissedTopics: [] };
   let projectConfigPath: string | undefined;
+  let projectNotesPath: string | undefined;
   let counter = new StepCounter();
   // Bumped on session_start and session_shutdown; async work captures the
   // value at start and stops touching shared state when it no longer matches.
@@ -126,9 +149,11 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   let popupDone: ((value: unknown) => void) | null = null;
   let popupHandle: OverlayHandleLike | null = null;
 
-  // Persistence of permanent dismissals flows through the /ysk ActionDeps
-  // (`persist` below), the single write path; no store-level callback.
-  const store = new NoteStore();
+  // Persistence is injected, not owned by the store: pending-note writes
+  // funnel through persistNotes below (one serialized chain), while the
+  // permanent-dismissal list flows through the /ysk ActionDeps (`persist`
+  // below), the single dismissed write path.
+  const store = new NoteStore({ persistPending: (notes) => persistNotes(notes) });
 
   // --- gated overlay rendering ---------------------------------------------
 
@@ -479,18 +504,34 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
     try {
       const cwd = typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
       projectConfigPath = join(cwd, ".pi", "you-should-know.json");
+      projectNotesPath = join(cwd, ".pi", "you-should-know-notes.json");
       sessionConfig = await loadConfig(projectConfigPath, USER_CONFIG_PATH);
     } catch {
       sessionConfig = { reviewEvery: DEFAULT_REVIEW_EVERY, dismissedTopics: [] };
     }
     if (gen !== generation) return; // session replaced or shut down while loading
 
-    // v1: session-only notes — clear pending, keep permanent dismissals
-    // authoritative from config (idempotent re-seed, no config writes).
+    // Restore BEFORE any store mutation: loadPendingNotes reads the state
+    // file directly, while mutations persist through notesWriteChain. The
+    // reseed below fires persistPending writes even when it removes
+    // nothing, so mutating first could race the read and see an emptied
+    // file — silently wiping the project's persisted notes. Loading first
+    // keeps every chain write strictly after the read, and the chain's FIFO
+    // order then makes the final restore write authoritative.
+    const persisted = await loadPendingNotes(projectNotesPath);
+    if (gen !== generation) return; // session replaced or shut down while loading
+
+    // Reset pending for the new session, keeping permanent dismissals
+    // authoritative from config (idempotent re-seed, no config writes), then
+    // restore the persisted notes minus topics this session already
+    // dismisses permanently, so the tally survives restarts. Notes removed
+    // from the pending store are simply absent from the file and never
+    // resurrect.
     store.clearPending();
     for (const topic of sessionConfig.dismissedTopics) {
       if (!store.isDismissed(topic)) store.dismissPermanently(topic);
     }
+    store.replacePending(persisted.filter((note) => !store.isDismissed(note.topic)));
     requestRender(ctx);
   }
 
@@ -679,6 +720,24 @@ export default function youShouldKnowExtension(pi: ExtensionAPI): void {
   function markProcessed(note: Note): void {
     store.dismissSession(note.topic);
     requestRender(ctxRef);
+  }
+
+  /**
+   * Persist the current pending notes to the per-project state file
+   * (.pi/you-should-know-notes.json). Every write funnels through the
+   * shared notesWriteChain so mutations (notably session_start's
+   * clear-then-restore pair) can never reorder on disk, and every failure
+   * is swallowed: persistence is best-effort and must never reach the
+   * runtime. No-op until session_start has resolved a project cwd.
+   */
+  function persistNotes(notes: Note[]): void {
+    const path = projectNotesPath;
+    if (!path) return;
+    notesWriteChain = notesWriteChain
+      .then(() => savePendingNotes(path, notes))
+      .catch(() => {
+        // quiet: a failed notes write must never crash the session
+      });
   }
 
   function persistDismissed(topics: string[]): Promise<void> {

@@ -18,6 +18,8 @@ and fails quiet by design.
   interrupts work — and are surfaced in a **tally sidebar** docked to the right edge of
   the terminal (severity-colored, keyboard-focus-free).
 - The agent can also record notes directly through the `heads_up` tool.
+- Pending notes are **persisted per project** in `.pi/you-should-know-notes.json`, so
+  unprocessed notes survive closing and reloading pi (see below).
 - Reviews are fire-and-forget: a slow or broken reviewer never blocks or breaks the
   session. `session_shutdown` and session replacement abort in-flight reviews.
 
@@ -49,6 +51,17 @@ never takes keyboard focus.
 
 `Esc` closes the popup without processing anything. Mouse clicks require a
 fullscreen/alt-screen terminal (pi enables mouse there); in plain terminals use `/ysk`.
+
+### Pending notes persist across restarts
+
+The pending store is mirrored to a per-project state file,
+`.pi/you-should-know-notes.json` (plain JSON, `{ "notes": [...] }`, oldest first).
+Unprocessed notes are restored on the next session start, so the tally survives
+closing and reloading pi. A note leaves the file — and never resurfaces — once it is
+processed (`Understood`/`Chat`), dismissed (`0`), permanently known, or evicted by
+the 3-note cap. Permanently dismissed topics are additionally blocked from ever
+being re-raised (see `dismissedTopics` below). The file is pure state: gitignore it
+freely, and delete it to reset the project's pending notes.
 
 ## Install
 
@@ -94,6 +107,11 @@ union of both:
   or a bare `"model-id"` matched across all known models. An unknown model falls
   back to the session's current model.
 
+Pending notes live in a separate **state** file, `.pi/you-should-know-notes.json`,
+written entirely by the extension (one `{ "notes": [...] }` object, oldest first).
+A missing or corrupt file simply starts empty; delete it (or gitignore it) to reset
+the project's pending notes.
+
 ## `/ysk` actions
 
 The `/ysk` command set stays as a fallback (discovery, scripting, older notes):
@@ -105,7 +123,7 @@ The `/ysk` command set stays as a fallback (discovery, scripting, older notes):
 | `/ysk learn [n]` | Open the popup for a specific note (1-based, oldest = 1). |
 | `/ysk known [n]` | "Knew this already": dismiss the topic **permanently** (persisted); the reviewer will skip it from now on. |
 | `/ysk chat [n]` | Fill the prompt editor with the composed note and mark it processed; you review and send it yourself. |
-| `/ysk dismiss [n]` | Hide the note for **this session only** (not persisted). |
+| `/ysk dismiss [n]` | Hide the note for **this session only** (the dismissal itself is not persisted; the note is removed from the pending-notes file, though the reviewer may re-raise the topic in a later session). |
 
 Notes are addressed newest-first by default; `n` is a 1-based index in the widget's
 display order (oldest = 1). A bare number (`/ysk 2`) is shorthand for `/ysk learn 2`.
@@ -140,7 +158,8 @@ throws: bad input returns an error result to the model instead.
 
 - Rule-based detectors (everything comes from the reviewer model or `heads_up`).
 - Transient notifications or transcript entries for notes.
-- Persisting notes across sessions (notes are session-only; only *dismissals* persist).
+- Persisting processed notes, note history, or session-dismissal state (only
+  *pending* notes and *permanent dismissals* persist).
 - Keyboard shortcuts for note actions, auto-dismiss heuristics, note history view.
 
 ## Troubleshooting
@@ -149,6 +168,7 @@ The extension **fails quiet by design**: a failed review (missing API key, netwo
 error, unknown model) is swallowed and the widget simply stays as it was. If the HUD
 seems stuck, run `/ysk status` — it shows the cadence, whether a review is in
 flight, and the pending/dismissed counts. Permanently dismissed topics live in
-`.pi/you-should-know.json`; delete an entry there to un-dismiss it.
+`.pi/you-should-know.json`; delete an entry there to un-dismiss it. Pending notes
+live in `.pi/you-should-know-notes.json`; delete the file to clear the tally.
 
 Design and task breakdown: [odd/tasks/you-should-know.md](odd/tasks/you-should-know.md).

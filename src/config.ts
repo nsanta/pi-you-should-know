@@ -10,7 +10,7 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
-import { normalizeTopic } from "./notes.ts";
+import { coerceSeverity, normalizeTopic, type Note } from "./notes.ts";
 
 /** Review cadence default: run the background reviewer every N tool steps. */
 export const DEFAULT_REVIEW_EVERY = 6;
@@ -74,6 +74,53 @@ export async function saveDismissed(projectPath: string, topics: string[]): Prom
   const json = `${JSON.stringify(next, null, 2)}\n`;
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, json, "utf8");
+}
+
+/**
+ * Load the pending notes persisted for a project from a state file written
+ * by savePendingNotes (`{ "notes": [...] }`, oldest first). Missing,
+ * corrupt, or non-object files are treated as empty, and every entry is
+ * validated defensively: entries must be objects with a non-empty topic
+ * (normalized); severity falls back to "info" and missing title/detail
+ * become empty strings. Invalid entries are skipped, never fatal.
+ */
+export async function loadPendingNotes(path?: string): Promise<Note[]> {
+  const raw = await readRawObject(expandTildePath(path));
+  const entries = raw.notes;
+  if (!Array.isArray(entries)) return [];
+
+  const notes: Note[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    if (typeof record.topic !== "string") continue;
+    const topic = normalizeTopic(record.topic);
+    if (topic.length === 0) continue;
+    notes.push({
+      topic,
+      severity: coerceSeverity(record.severity),
+      title: typeof record.title === "string" ? record.title : "",
+      detail: typeof record.detail === "string" ? record.detail : "",
+    });
+  }
+  return notes;
+}
+
+/**
+ * Persist the pending notes for a project into a state file as pretty JSON
+ * with a trailing newline (`{ "notes": [...] }`, oldest first), creating
+ * the file (and its parent directory) when missing. The write replaces the
+ * previous content wholesale: notes removed from the pending store are
+ * simply absent afterwards. Non-string/empty paths are skipped quietly;
+ * real write errors propagate so the caller can fail quiet.
+ */
+export async function savePendingNotes(path: string, notes: Note[]): Promise<void> {
+  const resolved = expandTildePath(path);
+  if (typeof resolved !== "string" || resolved.length === 0) return;
+
+  const json = `${JSON.stringify({ notes: Array.isArray(notes) ? notes : [] }, null, 2)}\n`;
+  await mkdir(dirname(resolved), { recursive: true });
+  await writeFile(resolved, json, "utf8");
 }
 
 /** Read one config file into a permissive field map; absent/corrupt => empty. */
