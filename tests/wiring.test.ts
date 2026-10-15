@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -155,6 +155,10 @@ async function setup(
     hasUI?: boolean;
     outcome?: StreamOutcome;
     ctxOverrides?: Record<string, unknown>;
+    /** Factory override env; defaults to a fixture HOME so relay dirs never touch the real agent home. */
+    env?: NodeJS.ProcessEnv;
+    /** Factory override relay dir (injected tmp dir for relay tests). */
+    relayDir?: string;
   } = {},
 ) {
   writeProjectConfig(options.config ?? {});
@@ -187,7 +191,10 @@ async function setup(
     hasUI: options.hasUI ?? true,
     ...options.ctxOverrides,
   });
-  youShouldKnowExtension(pi as never);
+  youShouldKnowExtension(pi as never, {
+    env: options.env ?? { HOME: FIXTURES },
+    ...(options.relayDir !== undefined ? { relayDir: options.relayDir } : {}),
+  });
   await handlers.get("session_start")![0]({ type: "session_start", reason: "startup" }, ctx);
   return {
     registry,
@@ -1050,5 +1057,126 @@ describe("you-should-know pending-note persistence", () => {
     // landed — a fresh project must not create the file at all.
     await flushPendingNoteWrites();
     expect(existsSync(PROJECT_NOTES)).toBe(false);
+  });
+});
+
+// --- subagent relay (ysk-subagent-relay) -----------------------------------------
+
+describe("you-should-know subagent relay", () => {
+  const mkdtemp = (): string => mkdtempSync(join(tmpdir(), "ysk-relay-wiring-"));
+
+  /** Poll a condition with a bounded deadline so async relay I/O stays out of assertions. */
+  async function waitFor(condition: () => boolean | Promise<boolean>, description: string, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await condition()) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(await condition(), `timed out waiting for ${description}`).toBe(true);
+  }
+
+  async function statusText(session: Awaited<ReturnType<typeof setup>>): Promise<string> {
+    await session.commands.get("ysk").handler("status", session.ctx);
+    return session.ui.notify.mock.calls.at(-1)![0] as string;
+  }
+
+  it("child mode: a background review is relayed as JSONL into the injected relay dir", async () => {
+    const relayDir = mkdtemp();
+    try {
+      const session = await setup({
+        config: { reviewEvery: 1 },
+        env: { GENTLE_PI_AGENTS_CHILD: "1", HOME: FIXTURES },
+        relayDir,
+      });
+      session.handlers.get("tool_execution_end")![0](toolEndEvent("child-1"), session.ctx);
+      await waitFor(
+        () => existsSync(relayDir) && readdirSync(relayDir).filter((name) => name.endsWith(".jsonl")).length > 0,
+        "the child's relay file",
+      );
+      const [fileName] = readdirSync(relayDir).filter((name) => name.endsWith(".jsonl"));
+      const lines = readFileSync(join(relayDir, fileName!), "utf8").trimEnd().split("\n");
+      expect(lines).toHaveLength(2); // one per reviewer note (REVIEW_NOTES)
+      const parsed = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(parsed.map((entry) => entry.id)).toEqual([`${fileName!.replace(/\.jsonl$/, "")}:1`, `${fileName!.replace(/\.jsonl$/, "")}:2`]);
+      expect(parsed[0]).toMatchObject({
+        v: 1,
+        sessionId: fileName!.replace(/\.jsonl$/, ""),
+        note: { topic: "silent assumption", severity: "warning", title: "Silent assumption" },
+      });
+      expect(parsed[0]!.cwd).toBe(CWD); // the child's cwd rides along for the parent's display
+      // /ysk status reports the file the child writes to.
+      expect(await statusText(session)).toContain(`subagent relay: writing to ${relayDir}/`);
+    } finally {
+      rmSync(relayDir, { recursive: true, force: true });
+    }
+  });
+
+  it("parent mode: a seeded relay line is ingested into the store and marked subagent", async () => {
+    const relayDir = mkdtemp();
+    try {
+      const line = {
+        v: 1,
+        id: "child-session:1",
+        ts: Date.now(),
+        cwd: "/tmp/child-cwd",
+        sessionId: "child-session",
+        note: { topic: "relayed finding", severity: "critical", title: "Relayed finding", detail: "from the child" },
+      };
+      mkdirSync(relayDir, { recursive: true });
+      writeFileSync(join(relayDir, "child-session.jsonl"), `${JSON.stringify(line)}\n`, "utf8");
+      const session = await setup({ env: { HOME: FIXTURES }, relayDir });
+
+      // The watcher's fire-and-forget start() scans the dir; wait for the store.
+      await waitFor(async () => {
+        await session.commands.get("ysk").handler("status", session.ctx);
+        return (session.ui.notify.mock.calls.at(-1)![0] as string).includes("pending notes: 1");
+      }, "the relayed note to reach the store");
+
+      const status = await statusText(session);
+      expect(status).toContain("pending notes: 1");
+      expect(status).toContain("subagent relay: on · ingested 1 notes");
+
+      // The sidebar shows the dedicated subagent pool row...
+      expect(session.customCalls.length).toBeGreaterThan(0);
+      expect(renderOf(session.customCalls[0]!)).toContain("■ 1 subagent");
+
+      // ...and the popup marks the note's subagent origin.
+      await session.commands.get("ysk").handler("", session.ctx); // 1 note -> detail stage
+      const popup = session.customCalls.at(-1)!;
+      expect(renderOf(popup)).toContain("via subagent · child-cwd");
+    } finally {
+      rmSync(relayDir, { recursive: true, force: true });
+    }
+  });
+
+  it("session_shutdown closes an active watcher quiet; a second session_start works", async () => {
+    const relayDir = mkdtemp();
+    try {
+      const line = {
+        v: 1,
+        id: "child-session:1",
+        ts: Date.now(),
+        cwd: "/tmp/child-cwd",
+        sessionId: "child-session",
+        note: { topic: "relayed finding", severity: "critical", title: "Relayed finding", detail: "" },
+      };
+      mkdirSync(relayDir, { recursive: true });
+      writeFileSync(join(relayDir, "child-session.jsonl"), `${JSON.stringify(line)}\n`, "utf8");
+      const session = await setup({ env: { HOME: FIXTURES }, relayDir });
+      await waitFor(async () => {
+        await session.commands.get("ysk").handler("status", session.ctx);
+        return (session.ui.notify.mock.calls.at(-1)![0] as string).includes("pending notes: 1");
+      }, "the relayed note to reach the store");
+
+      expect(() => session.handlers.get("session_shutdown")![0]({ type: "session_shutdown", reason: "quit" }, session.ctx)).not.toThrow();
+
+      // A second session over the same relay dir starts cleanly; the seeded
+      // line is still inside the age window, and the store dedupes its topic.
+      await session.handlers.get("session_start")![0]({ type: "session_start", reason: "resume" }, session.ctx);
+      const statusSecond = await statusText(session);
+      expect(statusSecond).toContain("pending notes: 1");
+      expect(statusSecond).toContain("subagent relay: on");
+    } finally {
+      rmSync(relayDir, { recursive: true, force: true });
+    }
   });
 });

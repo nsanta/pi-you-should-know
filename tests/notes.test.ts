@@ -221,6 +221,46 @@ describe("NoteStore persistPending", () => {
   });
 });
 
+describe("NoteStore onAdd", () => {
+  it("fires on every real add with the exact note", () => {
+    const onAdd = vi.fn();
+    const store = new NoteStore({ onAdd });
+    const first = note("one");
+    const second = note("two", "critical");
+    store.add(first);
+    store.add(second);
+    expect(onAdd).toHaveBeenCalledTimes(2);
+    expect(onAdd).toHaveBeenNthCalledWith(1, first);
+    expect(onAdd).toHaveBeenNthCalledWith(2, second);
+  });
+
+  it("never fires for a duplicate add", () => {
+    const onAdd = vi.fn();
+    const store = new NoteStore({ onAdd });
+    store.add(note("API Keys"));
+    expect(store.add(note("api   keys", "warning", "Different title"))).toBe(false);
+    expect(onAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it("never fires for replacePending, even when the list changes", () => {
+    const onAdd = vi.fn();
+    const store = new NoteStore({ onAdd });
+    store.replacePending([note("a"), note("b")]);
+    store.replacePending([note("a")]);
+    store.replacePending([]);
+    expect(onAdd).not.toHaveBeenCalled();
+    // ...but a real add still fires afterwards (the hook stays armed).
+    store.add(note("c"));
+    expect(onAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays optional: the store works without it", () => {
+    const store = new NoteStore();
+    expect(() => store.add(note("one"))).not.toThrow();
+    expect(store.add(note("one"))).toBe(false);
+  });
+});
+
 describe("formatNotesForChat", () => {
   it("formats one or more notes as a chat message", () => {
     const text = formatNotesForChat([
@@ -235,5 +275,14 @@ describe("formatNotesForChat", () => {
 
   it("returns an empty string for no notes", () => {
     expect(formatNotesForChat([])).toBe("");
+  });
+
+  it("appends '(via subagent)' to subagent-origin entries only", () => {
+    const text = formatNotesForChat([
+      note("relayed", "warning", "Relayed", "detail"),
+      { ...note("local", "info", "Local"), origin: { via: "subagent", cwd: "/child/dir", sessionId: "s" } },
+    ]);
+    expect(text).toContain("- [warning] Relayed\n");
+    expect(text).toContain("- [info] Local (via subagent)");
   });
 });

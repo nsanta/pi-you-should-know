@@ -11,9 +11,13 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { coerceSeverity, normalizeTopic, type Note } from "./notes.ts";
+import { parseOrigin } from "./relay.ts";
 
 /** Review cadence default: run the background reviewer every N tool steps. */
 export const DEFAULT_REVIEW_EVERY = 6;
+
+/** Subagent relay default ingest window, in hours. */
+export const DEFAULT_RELAY_MAX_AGE_HOURS = 24;
 
 /** Fully resolved extension configuration. */
 export interface YskConfig {
@@ -21,6 +25,10 @@ export interface YskConfig {
   reviewEvery: number;
   /** Optional model override for the nested reviewer call. */
   model?: string;
+  /** Relay subagent notes: the child writes them out, the parent ingests them. Default true. */
+  subagentRelay: boolean;
+  /** Ingest window for relayed notes, in hours (floored integer, minimum 1). Default 24. */
+  subagentRelayMaxAgeHours: number;
   /** Permanently dismissed topics (normalized), union of user + project. */
   dismissedTopics: string[];
 }
@@ -52,9 +60,14 @@ export async function loadConfig(projectPath?: string, userPath?: string): Promi
 
   const reviewEvery = pickReviewEvery(project.get("reviewEvery"), user.get("reviewEvery"));
   const model = pickModel(project.get("model"), user.get("model"));
+  const subagentRelay = pickBoolean(DEFAULT_RELAY_ENABLED, project.get("subagentRelay"), user.get("subagentRelay"));
+  const subagentRelayMaxAgeHours = pickHours(
+    project.get("subagentRelayMaxAgeHours"),
+    user.get("subagentRelayMaxAgeHours"),
+  );
   const dismissedTopics = unionTopics([...readTopics(user), ...readTopics(project)]);
 
-  return { reviewEvery, ...(model !== undefined ? { model } : {}), dismissedTopics };
+  return { reviewEvery, ...(model !== undefined ? { model } : {}), subagentRelay, subagentRelayMaxAgeHours, dismissedTopics };
 }
 
 /**
@@ -96,11 +109,13 @@ export async function loadPendingNotes(path?: string): Promise<Note[]> {
     if (typeof record.topic !== "string") continue;
     const topic = normalizeTopic(record.topic);
     if (topic.length === 0) continue;
+    const origin = parseOrigin(record.origin);
     notes.push({
       topic,
       severity: coerceSeverity(record.severity),
       title: typeof record.title === "string" ? record.title : "",
       detail: typeof record.detail === "string" ? record.detail : "",
+      ...(origin !== undefined ? { origin } : {}),
     });
   }
   return notes;
@@ -142,6 +157,9 @@ async function readRawObject(path: string | undefined): Promise<Record<string, u
   }
 }
 
+/** Default subagent relay switch. */
+const DEFAULT_RELAY_ENABLED = true;
+
 /**
  * Resolve reviewEvery: project overrides user; must be a finite number >= 1
  * (floored to an integer); otherwise the default applies.
@@ -153,6 +171,31 @@ function pickReviewEvery(...candidates: unknown[]): number {
     }
   }
   return DEFAULT_REVIEW_EVERY;
+}
+
+/**
+ * Resolve a boolean: project overrides user; only strict true/false count —
+ * anything else (strings, numbers, null) falls through to the next
+ * candidate, then the default.
+ */
+function pickBoolean(fallback: boolean, ...candidates: unknown[]): boolean {
+  for (const candidate of candidates) {
+    if (typeof candidate === "boolean") return candidate;
+  }
+  return fallback;
+}
+
+/**
+ * Resolve an hours value: project overrides user; must be a finite number
+ * >= 1, floored to an integer; otherwise the default applies.
+ */
+function pickHours(...candidates: unknown[]): number {
+  for (const candidate of candidates) {
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 1) {
+      return Math.floor(candidate);
+    }
+  }
+  return DEFAULT_RELAY_MAX_AGE_HOURS;
 }
 
 /** Resolve model: project overrides user; must be a non-empty string. */

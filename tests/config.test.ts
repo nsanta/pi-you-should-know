@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_RELAY_MAX_AGE_HOURS,
   DEFAULT_REVIEW_EVERY,
   expandTildePath,
   loadConfig,
@@ -19,6 +20,13 @@ vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
   return { ...actual, homedir: () => fakeHome };
 });
+
+const DEFAULTS = {
+  reviewEvery: DEFAULT_REVIEW_EVERY,
+  subagentRelay: true,
+  subagentRelayMaxAgeHours: DEFAULT_RELAY_MAX_AGE_HOURS,
+  dismissedTopics: [],
+};
 
 let root: string;
 
@@ -46,13 +54,13 @@ function writeJson(path: string, value: unknown): void {
 describe("loadConfig", () => {
   it("returns defaults when both files are missing", async () => {
     const config = await loadConfig(join(root, "nope", "project.json"), join(root, "nope", "user.json"));
-    expect(config).toEqual({ reviewEvery: DEFAULT_REVIEW_EVERY, dismissedTopics: [] });
+    expect(config).toEqual(DEFAULTS);
     expect(config.model).toBeUndefined();
   });
 
   it("skips undefined paths", async () => {
     const config = await loadConfig(undefined, undefined);
-    expect(config).toEqual({ reviewEvery: DEFAULT_REVIEW_EVERY, dismissedTopics: [] });
+    expect(config).toEqual(DEFAULTS);
   });
 
   it("applies user config when no project config exists", async () => {
@@ -90,7 +98,7 @@ describe("loadConfig", () => {
     writeFileSync(user, "{ not json", "utf8");
     writeFileSync(project, "]]] garbage", "utf8");
     const config = await loadConfig(project, user);
-    expect(config).toEqual({ reviewEvery: DEFAULT_REVIEW_EVERY, dismissedTopics: [] });
+    expect(config).toEqual(DEFAULTS);
   });
 
   it("falls back to user config when only the project file is corrupt", async () => {
@@ -107,11 +115,13 @@ describe("loadConfig", () => {
     writeJson(project, {
       reviewEvery: "six",
       model: 42,
+      subagentRelay: "yes",
+      subagentRelayMaxAgeHours: "soon",
       dismissedTopics: "naming",
       extra: true,
     });
     const config = await loadConfig(project, undefined);
-    expect(config).toEqual({ reviewEvery: DEFAULT_REVIEW_EVERY, dismissedTopics: [] });
+    expect(config).toEqual(DEFAULTS);
   });
 
   it("coerces reviewEvery to a positive integer, ignoring invalid values", async () => {
@@ -129,6 +139,42 @@ describe("loadConfig", () => {
     expect(config.reviewEvery).toBe(12);
     expect(expandTildePath("~/x/y.json")).toBe(join(fakeHome, "x", "y.json"));
     expect(expandTildePath("/plain/path.json")).toBe("/plain/path.json");
+  });
+
+  it("resolves subagentRelay: default true, project overrides user, non-boolean falls back", async () => {
+    const both = join(root, "relay-both.json");
+    writeJson(both, { subagentRelay: false });
+    expect((await loadConfig(both, undefined)).subagentRelay).toBe(false);
+
+    const project = join(root, "relay-project.json");
+    const user = join(root, "relay-user.json");
+    writeJson(project, { subagentRelay: false });
+    writeJson(user, { subagentRelay: true });
+    expect((await loadConfig(project, user)).subagentRelay).toBe(false); // project wins
+
+    const invalid = join(root, "relay-invalid.json");
+    writeJson(invalid, { subagentRelay: "off" });
+    expect((await loadConfig(invalid, undefined)).subagentRelay).toBe(true); // strict boolean, else default
+  });
+
+  it("resolves subagentRelayMaxAgeHours: default 24, floored, minimum 1", async () => {
+    const floor = join(root, "hours-floor.json");
+    writeJson(floor, { subagentRelayMaxAgeHours: 7.9 });
+    expect((await loadConfig(floor, undefined)).subagentRelayMaxAgeHours).toBe(7);
+
+    const zero = join(root, "hours-zero.json");
+    writeJson(zero, { subagentRelayMaxAgeHours: 0 });
+    expect((await loadConfig(zero, undefined)).subagentRelayMaxAgeHours).toBe(DEFAULT_RELAY_MAX_AGE_HOURS);
+
+    const fraction = join(root, "hours-fraction.json");
+    writeJson(fraction, { subagentRelayMaxAgeHours: 0.5 });
+    expect((await loadConfig(fraction, undefined)).subagentRelayMaxAgeHours).toBe(DEFAULT_RELAY_MAX_AGE_HOURS);
+
+    const project = join(root, "hours-project.json");
+    const user = join(root, "hours-user.json");
+    writeJson(project, { subagentRelayMaxAgeHours: 2 });
+    writeJson(user, { subagentRelayMaxAgeHours: 99 });
+    expect((await loadConfig(project, user)).subagentRelayMaxAgeHours).toBe(2); // project wins
   });
 });
 
@@ -205,6 +251,32 @@ describe("loadPendingNotes", () => {
       { topic: "api keys", severity: "critical", title: "Keep", detail: "kept" },
       { topic: "bad severity", severity: "info", title: "Coerced", detail: "" },
       { topic: "mixed case", severity: "warning", title: "", detail: "" },
+    ]);
+  });
+
+  it("round-trips a well-formed origin and drops malformed ones", async () => {
+    const path = join(root, "notes-origin.json");
+    const notes: Note[] = [
+      { topic: "relayed", severity: "warning", title: "Relayed", detail: "", origin: { via: "subagent", cwd: "/child/dir", sessionId: "s" } },
+      { topic: "no-origin", severity: "info", title: "Local", detail: "" },
+    ];
+    await savePendingNotes(path, notes);
+    expect(await loadPendingNotes(path)).toEqual(notes);
+
+    const defensive = join(root, "notes-origin-defensive.json");
+    writeJson(defensive, {
+      notes: [
+        { topic: "good", origin: { via: "subagent", cwd: "/c" } },
+        { topic: "bad-via", origin: { via: "local" } },
+        { topic: "bad-shape", origin: "subagent" },
+        { topic: "bad-fields", origin: { via: "subagent", cwd: 42 } },
+      ],
+    });
+    expect(await loadPendingNotes(defensive)).toEqual([
+      { topic: "good", severity: "info", title: "", detail: "", origin: { via: "subagent", cwd: "/c" } },
+      { topic: "bad-via", severity: "info", title: "", detail: "" },
+      { topic: "bad-shape", severity: "info", title: "", detail: "" },
+      { topic: "bad-fields", severity: "info", title: "", detail: "", origin: { via: "subagent" } },
     ]);
   });
 

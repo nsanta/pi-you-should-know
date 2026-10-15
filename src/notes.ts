@@ -8,6 +8,8 @@
  * done on normalized topics.
  */
 
+import { parseOrigin, type NoteOrigin } from "./relay.ts";
+
 /** Severity of a "you should know" note. Unknown severities normalize to "info". */
 export type Severity = "info" | "warning" | "critical";
 
@@ -18,6 +20,13 @@ export interface Note {
   severity: Severity;
   title: string;
   detail: string;
+  /**
+   * Where the note came from: absent for session-local notes (reviewer and
+   * heads_up findings raised in this process), set only by the relay
+   * ingester for notes relayed from subagent children, and round-tripped
+   * through the notes file so a restored note keeps its subagent marker.
+   */
+  origin?: NoteOrigin;
 }
 
 /** Maximum number of pending notes kept/shown at once. */
@@ -67,6 +76,12 @@ export interface NoteStoreOptions {
    * list with itself) never fire.
    */
   persistPending?: (notes: Note[]) => void;
+  /**
+   * Fired on REAL adds only — add() when the note actually lands, never on
+   * replacePending() (and never for duplicate adds) — so the relay writer
+   * mirrors genuinely new notes while restore/reseed flows never echo.
+   */
+  onAdd?: (note: Note) => void;
 }
 
 /**
@@ -77,6 +92,7 @@ export class NoteStore {
   private readonly capacity: number;
   private readonly persistDismissed?: (topics: string[]) => void;
   private readonly persistPending?: (notes: Note[]) => void;
+  private readonly onAdd?: (note: Note) => void;
   private items: Note[] = [];
   private readonly permanent = new Set<string>();
   private readonly session = new Set<string>();
@@ -86,17 +102,22 @@ export class NoteStore {
     this.capacity = Number.isFinite(capacity) && capacity >= 1 ? Math.floor(capacity) : PENDING_CAP;
     this.persistDismissed = options.persistDismissed;
     this.persistPending = options.persistPending;
+    this.onAdd = options.onAdd;
   }
 
   /**
    * Add a note unless a pending note with the same normalized topic exists.
    * Returns true when the note was added, false when it was a duplicate.
    * Evicts the oldest pending note once over capacity. Real adds hand the
-   * new pending list to the persistPending callback; duplicates do not.
+   * new pending list to the persistPending callback and fire the onAdd
+   * hook; duplicates do neither.
    */
   add(note: Note): boolean {
     const added = this.push(note);
-    if (added) this.persistPending?.(this.pending);
+    if (added) {
+      this.persistPending?.(this.pending);
+      this.onAdd?.(note);
+    }
     return added;
   }
 
@@ -200,7 +221,8 @@ export function formatNotesForChat(notes: Note[]): string {
   const lines = list.map((note) => {
     const severity = SEVERITY_LABELS[note.severity] ?? "info";
     const title = typeof note.title === "string" && note.title.trim().length > 0 ? note.title.trim() : note.topic;
-    const line = `- [${severity}] ${title}`;
+    const suffix = note.origin?.via === "subagent" ? " (via subagent)" : "";
+    const line = `- [${severity}] ${title}${suffix}`;
     return typeof note.detail === "string" && note.detail.trim().length > 0 ? `${line}\n  ${note.detail.trim()}` : line;
   });
   return ["**You should know** (background reviewer)", "", ...lines].join("\n");

@@ -63,6 +63,41 @@ the 3-note cap. Permanently dismissed topics are additionally blocked from ever
 being re-raised (see `dismissedTopics` below). The file is pure state: gitignore it
 freely, and delete it to reset the project's pending notes.
 
+## Subagent relay
+
+pi-you-should-know loads in every pi process — including gentle-pi subagent children
+(headless `pi --mode rpc`). Notes raised inside a child (background reviewer or
+`heads_up`) are relayed to parent sessions over a file convention, so they surface in
+the parent's usual card, popup, and `/ysk` surfaces, marked `subagent`:
+
+- A **child** process (`GENTLE_PI_AGENTS_CHILD=1`) appends one JSON line per new note
+  to `<agentHome>/you-should-know/relay/<sessionId>.jsonl`.
+- A **parent** session watches the shared relay dir, ingests fresh lines (24 h window
+  by default), skips already-seen and permanently dismissed topics, and shows relayed
+  notes with a muted `subagent` marker (a trailing `■ <n> subagent` pool row in the
+  card, `· subagent` in popup lists, `via subagent · <dir>` in note details, and
+  `(via subagent)` in composed chat text).
+
+Relay files live under the agent home resolved like gentle-pi's
+(`GENTLE_PI_AGENT_HOME` > `PI_CODING_AGENT_DIR` > `~/.pi/agent`):
+`<agentHome>/you-should-know/relay/`. Files idle for 7 days are garbage-collected.
+
+Two config keys (user + project layers, project wins):
+
+- `subagentRelay` (default `true`): the child writes and the parent ingests; set
+  `false` to turn the relay off entirely.
+- `subagentRelayMaxAgeHours` (default `24`, whole hours, minimum 1): how old a
+  relayed note may be and still surface.
+
+Restart semantics: the parent's read cursors and seen-ids live in memory, so after a
+parent restart unprocessed recent relay notes resurface; a note processed before the
+restart may resurface at most once (bounded by the age window). Dismissing or
+permanently knowing a topic stops its notes for good.
+
+Known limitation: the relay is a **global pool** — relayed notes cannot be attributed
+to a specific agents-card task in gentle-pi's rail (that mapping is gentle-pi
+internal), so they appear as one `subagent` group rather than per-task rows.
+
 ## Install
 
 As a pi package (recommended):
@@ -96,12 +131,14 @@ union of both:
 {
   "reviewEvery": 6,          // run the reviewer every N completed tool steps (>= 1)
   "model": "anthropic/claude-haiku-4-5",  // optional reviewer model override
+  "subagentRelay": true,     // relay subagent notes to the parent session
+  "subagentRelayMaxAgeHours": 24,  // ingest window for relayed notes (>= 1)
   "dismissedTopics": []      // permanently dismissed topics (managed via /ysk known)
 }
 ```
 
 - Missing files, missing fields, and corrupt JSON are tolerated: defaults stand in
-  (`reviewEvery: 6`, session model, no dismissals).
+  (`reviewEvery: 6`, session model, relay on with a 24 h window, no dismissals).
 - `saveDismissed` writes only to the **project** file and preserves its other fields.
 - `model` accepts either `"provider/model-id"` (looked up with the model registry)
   or a bare `"model-id"` matched across all known models. An unknown model falls
@@ -119,7 +156,7 @@ The `/ysk` command set stays as a fallback (discovery, scripting, older notes):
 | Command | Effect |
 | --- | --- |
 | `/ysk` | Open the popup over all pending notes (list stage when several, newest otherwise). |
-| `/ysk status` | Multi-line status: cadence, steps since last review, in-flight flag, pending count, dismissed count. |
+| `/ysk status` | Multi-line status: cadence, steps since last review, in-flight flag, pending count, dismissed count, subagent relay state. |
 | `/ysk learn [n]` | Open the popup for a specific note (1-based, oldest = 1). |
 | `/ysk known [n]` | "Knew this already": dismiss the topic **permanently** (persisted); the reviewer will skip it from now on. |
 | `/ysk chat [n]` | Fill the prompt editor with the composed note and mark it processed; you review and send it yourself. |
