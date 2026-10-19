@@ -171,6 +171,24 @@ gentle-pi internals degrade to the overlay. widget.ts: railHeadsUpRows(notes, {w
 rail part renders exact card at rail width, click routes, overlay suppressed when
 rail active, fallback intact without gentle-pi; suite + tsc green.
 
+### T10. Per-session note persistence (user-requested 2026-10-15)
+Product decision (user): persisted notes must be UNIQUE PER SESSION — resuming the
+same session restores its notes; a NEW session starts clean (its reviewer fills its
+own). Mechanics: notes move from the global `<cwd>/.pi/you-should-know-notes.json` to
+`<cwd>/.pi/you-should-know-notes/<sanitized-session-id>.json` (session id via the
+existing sessionManager helper the relay feature introduced; sanitize filename chars;
+missing id -> no persistence, memory-only, documented). Migration: on session_start,
+if the session file is absent and the legacy global file exists, adopt it into the
+starting session and DELETE the legacy file (adopt-once, best-effort; concurrent
+starts may race — tolerated). Retention: `pruneSessionNotes(dir, { keep = 20,
+maxAgeMs = 14d })` in config.ts deletes other session files by mtime (never the
+current one), run quiet on session_start before the read. Ordering keeps the T8-fix
+invariant: prune -> read current session file (or legacy adopt) -> gen check ->
+mutate. Relay flow unchanged (watcher -> store.add -> persistPending -> session
+file). Tests red first. Acceptance: same-session resume restores; different session
+id restores nothing from another session's file; legacy adopted once then removed;
+prune keeps recent/drops old; suite + tsc green.
+
 ## Evidence
 
 | Task | Commit | Result |
@@ -179,6 +197,7 @@ rail active, fallback intact without gentle-pi; suite + tsc green.
 | T2 sidebar wiring | e14bc7a | 172/172 green, tsc clean; nonCapturing right-center overlay, snapshot-first render, done-capture close, generation guards, session cleanup, fillEditor repaint via sessionTui; band coexists until T3; risk noted: sync factory invocation assumed (same as band) |
 | T3 popup + processed | 0ef86bb | 165/165 green, tsc clean, grep acceptance met (no band/key remnants in src); popup list/detail stages, mouse+keys, kitty-safe Esc, positional hit-guard, processed semantics (understood+chat -> dismissSession), /ysk popup parity, smoke test updated via approved unblock (smoke surface added by parent decision); pi-tui re-added for matchesKey |
 | Verify corrections | 6c514ce | gentle-ai-verify CONDITIONAL PASS -> three gaps fixed: sidebar click-to-popup wired (severityAtSidebarRow -> openPopup all/severity), list stage newest-first, strict mode===tui sidebar guard + rpc test. 168/168 green, tsc clean |
+| T10 per-session notes | (this commit) | notes move to .pi/you-should-know-notes/<sanitized-session-id>.json; adopt-once migration deletes the legacy global file; pruneSessionNotes (keep 20 / 14d, keepPath protected) runs before the read; T8 read-before-mutate invariant kept; relay wiring untouched. gentle-ai-verify PASS; 280/280 x2 (worker x3), tsc clean. Known edges (accepted): ids colliding after sanitization share a file (impossible for pi UUIDs); a session replaced during the prune/load await could re-point the path (needs overlapping inits, unreachable in pi); a corrupt legacy file is adopted as empty and deleted (matches delete-to-reset contract) |
 | T9 rail docking | (this commit) | gentle rail integration via Symbol.for state/cache (best-effort, silent degradation): "ysk" rail part renders railHeadsUpRows (newest-first per-note wrapped rows, digest + revision-bump freshness, click -> detail popup); overlay suppressed (render + mouse) while rail owns host; fallback compacted to 30% + minWidth 24 counts card; relay-feature preservation honored (teardown lines, factory overrides, setupRelay). Landed around a concurrent relay worker: builder/tests absorbed into ae662f8/a30b9f9, wiring committed here. gentle-ai-verify PASS; 268/268 x2 (worker x3), tsc clean |
 | Native review | lineage: NONE — blocked | START over committed range b742e691..HEAD rejected 3x: controller returns empty-candidate workspace status (empty_candidate_base_ref_required) without creating a lineage; untracked selection (.pi/you-should-know.json) resolved via select-intended-untracked; START loop stopped per contract. No authority created or burned. Feature otherwise verified (168/168, tsc clean, API cross-check, adversarial sweep clean). Retry in a fresh session or via maintainer CLI. |
 | T5 card restyle | adece77 | gentle-ai-worker TDD (red -> green), gentle-ai-verify PASS (geometry matches gentle-pi shell-card arithmetic; popup untouched); degenerate-width coverage gap closed by parent; 169/169 green, tsc clean |

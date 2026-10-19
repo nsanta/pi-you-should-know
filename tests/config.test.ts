@@ -1,14 +1,17 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_RELAY_MAX_AGE_HOURS,
+  DEFAULT_PRUNE_KEEP,
+  DEFAULT_PRUNE_MAX_AGE_MS,
   DEFAULT_REVIEW_EVERY,
   expandTildePath,
   loadConfig,
   loadPendingNotes,
+  pruneSessionNotes,
   saveDismissed,
   savePendingNotes,
 } from "../src/config.ts";
@@ -315,5 +318,94 @@ describe("savePendingNotes", () => {
     await expect(savePendingNotes(undefined as unknown as string, [])).resolves.toBeUndefined();
     await expect(savePendingNotes("", [])).resolves.toBeUndefined();
     expect(existsSync(join(fakeHome, "undefined"))).toBe(false);
+  });
+});
+
+describe("pruneSessionNotes", () => {
+  /**
+   * Create a session-notes file in `dir` with an explicit mtime (ms epoch).
+   * Returns its absolute path so tests can assert survival/deletion.
+   */
+  function seedNoteFile(dir: string, name: string, mtimeMs: number, content = "{}"): string {
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, name);
+    writeFileSync(path, content, "utf8");
+    const when = new Date(mtimeMs);
+    utimesSync(path, when, when);
+    return path;
+  }
+
+  it("keeps the most recent `keep` files and deletes older ones by count", async () => {
+    const dir = mkdtemp("ysk-prune-count-");
+    const base = Date.now() - 60 * 60 * 1000;
+    const newest = seedNoteFile(dir, "newest.json", base);
+    const recent = seedNoteFile(dir, "recent.json", base - 1000);
+    const old = seedNoteFile(dir, "old.json", base - 2000);
+    const oldest = seedNoteFile(dir, "oldest.json", base - 3000);
+    await pruneSessionNotes(dir, { keep: 2, maxAgeMs: DEFAULT_PRUNE_MAX_AGE_MS });
+    expect(existsSync(newest)).toBe(true);
+    expect(existsSync(recent)).toBe(true);
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(oldest)).toBe(false);
+  });
+
+  it("deletes files older than maxAgeMs even inside the keep window", async () => {
+    const dir = mkdtemp("ysk-prune-age-");
+    const fresh = seedNoteFile(dir, "fresh.json", Date.now());
+    const stale = seedNoteFile(dir, "stale.json", Date.now() - 2 * 24 * 60 * 60 * 1000);
+    await pruneSessionNotes(dir, { keep: 10, maxAgeMs: 24 * 60 * 60 * 1000 });
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(stale)).toBe(false);
+  });
+
+  it("applies the defaults: 20 most recent kept, 14-day age cap", async () => {
+    expect(DEFAULT_PRUNE_KEEP).toBe(20);
+    expect(DEFAULT_PRUNE_MAX_AGE_MS).toBe(14 * 24 * 60 * 60 * 1000);
+    const dir = mkdtemp("ysk-prune-defaults-");
+    const base = Date.now() - 60 * 60 * 1000;
+    const paths: string[] = [];
+    for (let i = 0; i < 21; i += 1) paths.push(seedNoteFile(dir, `s${i}.json`, base - i * 1000));
+    seedNoteFile(dir, "ancient.json", base - 15 * 24 * 60 * 60 * 1000); // old, but mtime ranks inside the keep window
+    await pruneSessionNotes(dir);
+    expect(existsSync(paths[0]!)).toBe(true); // newest survives
+    expect(existsSync(paths[19]!)).toBe(true); // 20th newest survives
+    expect(existsSync(paths[20]!)).toBe(false); // 21st newest: beyond the default keep
+    expect(existsSync(join(dir, "ancient.json"))).toBe(false); // older than the default 14 days
+  });
+
+  it("skips non-.json files", async () => {
+    const dir = mkdtemp("ysk-prune-nonjson-");
+    const ancient = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const txt = seedNoteFile(dir, "notes.txt", ancient);
+    const jsonl = seedNoteFile(dir, "child-session.jsonl", ancient);
+    await pruneSessionNotes(dir, { keep: 0 }); // would delete every .json file
+    expect(existsSync(txt)).toBe(true);
+    expect(existsSync(jsonl)).toBe(true);
+  });
+
+  it("no-ops quietly on a missing or invalid directory", async () => {
+    await expect(pruneSessionNotes(join(root, "nope", "missing-notes-dir"))).resolves.toBeUndefined();
+    await expect(pruneSessionNotes("")).resolves.toBeUndefined();
+  });
+
+  it("never deletes keepPath, whatever its age or rank", async () => {
+    const dir = mkdtemp("ysk-prune-keeppath-");
+    const current = seedNoteFile(dir, "current-session.json", Date.now() - 30 * 24 * 60 * 60 * 1000); // oldest AND stale
+    const other = seedNoteFile(dir, "other.json", Date.now());
+    await pruneSessionNotes(dir, { keep: 1, maxAgeMs: 24 * 60 * 60 * 1000, keepPath: current });
+    expect(existsSync(current)).toBe(true); // survives both prune reasons
+    expect(existsSync(other)).toBe(true);
+  });
+
+  it("tolerates unreadable and non-file .json entries quietly", async () => {
+    const dir = mkdtemp("ysk-prune-unreadable-");
+    seedNoteFile(dir, "kept.json", Date.now());
+    mkdirSync(join(dir, "subdir.json"), { recursive: true }); // stat succeeds, not a file -> skipped
+    const dangling = join(dir, "dangling.json");
+    symlinkSync(join(dir, "nope"), dangling); // stat fails (ENOENT) -> skipped
+    await expect(pruneSessionNotes(dir)).resolves.toBeUndefined();
+    expect(existsSync(join(dir, "kept.json"))).toBe(true);
+    expect(existsSync(join(dir, "subdir.json"))).toBe(true);
+    expect(readdirSync(dir).includes("dangling.json")).toBe(true); // existsSync reads through the symlink
   });
 });

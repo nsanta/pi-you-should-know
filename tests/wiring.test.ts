@@ -1,6 +1,6 @@
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import youShouldKnowExtension, { flushPendingNoteWrites } from "../src/index.ts";
 
@@ -9,7 +9,16 @@ import youShouldKnowExtension, { flushPendingNoteWrites } from "../src/index.ts"
 const FIXTURES = mkdtempSync(join(tmpdir(), "ysk-wiring-"));
 const CWD = join(FIXTURES, "ws");
 const PROJECT_CONFIG = join(CWD, ".pi", "you-should-know.json");
-const PROJECT_NOTES = join(CWD, ".pi", "you-should-know-notes.json");
+/** Pre-T10 global pending-notes file (adopt-once migration fixture). */
+const LEGACY_NOTES = join(CWD, ".pi", "you-should-know-notes.json");
+/** Per-session pending-notes directory (T10). */
+const NOTES_DIR = join(CWD, ".pi", "you-should-know-notes");
+/** The fake ctx's default session id; tests pass another via setup({ sessionId }). */
+const SESSION_ID = "wiring-session";
+/** Absolute path of one session's per-session pending-notes file. */
+const sessionNotesPath = (id: string): string => join(NOTES_DIR, `${id}.json`);
+/** The default fake session's notes file (what session_start restores/writes). */
+const SESSION_NOTES = sessionNotesPath(SESSION_ID);
 afterAll(() => {
   rmSync(FIXTURES, { recursive: true, force: true });
 });
@@ -20,13 +29,22 @@ function writeProjectConfig(config: Record<string, unknown>): void {
 }
 
 /**
- * Seed the per-project pending-notes state file. An array seeds
- * `{ notes: [...] }`; a string seeds raw file content (corrupt fixtures).
+ * Seed the pending-notes state file for a session (default: the fake ctx's
+ * session id). An array seeds `{ notes: [...] }`; a string seeds raw file
+ * content (corrupt fixtures).
  */
-function writePendingNotes(notes: unknown[] | string): void {
+function writeSessionNotes(notes: unknown[] | string, id: string = SESSION_ID): void {
+  const path = sessionNotesPath(id);
+  mkdirSync(dirname(path), { recursive: true });
+  const text = typeof notes === "string" ? notes : JSON.stringify({ notes });
+  writeFileSync(path, text, "utf8");
+}
+
+/** Seed the pre-T10 global pending-notes file (adopt-once migration fixture). */
+function writeLegacyNotes(notes: unknown[] | string): void {
   mkdirSync(join(CWD, ".pi"), { recursive: true });
   const text = typeof notes === "string" ? notes : JSON.stringify({ notes });
-  writeFileSync(PROJECT_NOTES, text, "utf8");
+  writeFileSync(LEGACY_NOTES, text, "utf8");
 }
 
 const readProjectConfig = (): Record<string, unknown> => JSON.parse(readFileSync(PROJECT_CONFIG, "utf8"));
@@ -102,6 +120,7 @@ interface RecordedCustomOpen {
 function mockCtx(
   registry: ReturnType<typeof fakeModelRegistry>,
   overrides: Record<string, unknown> = {},
+  sessionId: string = SESSION_ID,
 ) {
   /** Every ui.custom open, in order, with the pieces the overlay contract hands out. */
   const customCalls: RecordedCustomOpen[] = [];
@@ -140,6 +159,9 @@ function mockCtx(
     ui,
     sessionManager: {
       getBranch: (): unknown[] => [{ type: "message", message: { role: "user", content: "hello world" } }],
+      // Controllable session id: the per-session notes file (and the child
+      // relay writer) resolve through ctx.sessionManager.getSessionId().
+      getSessionId: (): string => sessionId,
     },
     modelRegistry: registry,
     model: { provider: "sess", id: "session-model" },
@@ -151,7 +173,12 @@ function mockCtx(
 async function setup(
   options: {
     config?: Record<string, unknown>;
+    /** Pending notes seeded into THIS session's state file. */
     notes?: unknown[] | string;
+    /** Pre-T10 global notes file seeded for adopt-once migration tests. */
+    legacyNotes?: unknown[] | string;
+    /** The fake ctx's session id (per-session notes file name). */
+    sessionId?: string;
     hasUI?: boolean;
     outcome?: StreamOutcome;
     ctxOverrides?: Record<string, unknown>;
@@ -164,12 +191,15 @@ async function setup(
   writeProjectConfig(options.config ?? {});
   // Deterministic baseline: a previous test's fire-and-forget notes write
   // may still be in flight, so drain the serialized write chain (a blind
-  // timeout cannot) before removing the state file — otherwise the stale
+  // timeout cannot) before removing state files — otherwise the stale
   // write would land after the removal and leak notes into this session's
   // restore.
   await flushPendingNoteWrites();
-  if (options.notes === undefined) rmSync(PROJECT_NOTES, { force: true });
-  else writePendingNotes(options.notes);
+  if (options.legacyNotes === undefined) rmSync(LEGACY_NOTES, { force: true });
+  else writeLegacyNotes(options.legacyNotes);
+  const sessionId = options.sessionId ?? SESSION_ID;
+  rmSync(sessionNotesPath(sessionId), { force: true }); // fresh baseline for THIS session only
+  if (options.notes !== undefined) writeSessionNotes(options.notes, sessionId);
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const handlers = new Map<string, Handler[]>();
@@ -190,7 +220,7 @@ async function setup(
   const { ctx, ui, customCalls, fakeOverlayTui, fakeHandle } = mockCtx(registry, {
     hasUI: options.hasUI ?? true,
     ...options.ctxOverrides,
-  });
+  }, sessionId);
   youShouldKnowExtension(pi as never, {
     env: options.env ?? { HOME: FIXTURES },
     ...(options.relayDir !== undefined ? { relayDir: options.relayDir } : {}),
@@ -1147,7 +1177,7 @@ describe("you-should-know note popup", () => {
   });
 });
 
-// --- pending-note persistence (T8) ----------------------------------------------
+// --- pending-note persistence (T8 per-project, T10 per-session) ------------------
 
 describe("you-should-know pending-note persistence", () => {
   const PERSISTED_NOTES = [
@@ -1210,17 +1240,74 @@ describe("you-should-know pending-note persistence", () => {
     customCalls[1]!.component.handleInput!("1"); // detail: "Hidden decision"
     customCalls[1]!.component.handleInput!("1"); // Understood
     await flushPendingNoteWrites(); // the rewrite flows through the serialized chain
-    const onDisk = JSON.parse(readFileSync(PROJECT_NOTES, "utf8")) as { notes: Array<{ topic: string }> };
+    const onDisk = JSON.parse(readFileSync(SESSION_NOTES, "utf8")) as { notes: Array<{ topic: string }> };
     expect(onDisk.notes.map((note) => note.topic)).toEqual(["silent assumption"]);
   });
 
-  it("stays quiet when the notes file is absent: nothing is written for a fresh project", async () => {
+  it("stays quiet when the notes file is absent: nothing is written for a fresh session", async () => {
     const { ui } = await setup();
     expect(ui.custom).not.toHaveBeenCalled();
     // Assert absence only after every write enqueued by session_start has
-    // landed — a fresh project must not create the file at all.
+    // landed — a fresh session must not create its state file at all.
     await flushPendingNoteWrites();
-    expect(existsSync(PROJECT_NOTES)).toBe(false);
+    expect(existsSync(SESSION_NOTES)).toBe(false);
+  });
+
+  it("resume: the same session id restores its own notes on a later session_start", async () => {
+    const { ctx, handlers, ui, customCalls } = await setup(); // first start: clean
+    expect(ui.custom).not.toHaveBeenCalled();
+    writeSessionNotes(PERSISTED_NOTES); // what this session persisted before closing
+    await handlers.get("session_start")![0]({ type: "session_start", reason: "resume" }, ctx);
+    expect(ui.custom).toHaveBeenCalledOnce(); // the tally reopens with the session's notes
+    const text = renderOf(customCalls[0]!);
+    expect(text).toContain("2 heads-up");
+    expect(text).toContain("1 critical");
+    expect(text).toContain("1 warning");
+  });
+
+  it("uniqueness: a different session id restores nothing from another session's file", async () => {
+    writeSessionNotes(PERSISTED_NOTES, "session-a");
+    const { ui } = await setup({ sessionId: "session-b" });
+    expect(ui.custom).not.toHaveBeenCalled(); // nothing restored, no tally
+    await flushPendingNoteWrites();
+    expect(existsSync(sessionNotesPath("session-a"))).toBe(true); // the other session's file is untouched
+  });
+
+  it("migration: the first starting session adopts the legacy global file, which is then removed", async () => {
+    const { ui, customCalls } = await setup({ legacyNotes: PERSISTED_NOTES });
+    expect(ui.custom).toHaveBeenCalledOnce();
+    expect(renderOf(customCalls[0]!)).toContain("2 heads-up"); // the adopted notes are restored
+    await flushPendingNoteWrites();
+    expect(existsSync(LEGACY_NOTES)).toBe(false); // removed after adoption
+    const onDisk = JSON.parse(readFileSync(SESSION_NOTES, "utf8")) as { notes: Array<{ topic: string }> };
+    expect(onDisk.notes.map((note) => note.topic)).toEqual(PERSISTED_NOTES.map((note) => note.topic));
+  });
+
+  it("migration: a second session_start finds no legacy file and keeps the session file authoritative", async () => {
+    const { ctx, handlers, ui, customCalls } = await setup({ legacyNotes: PERSISTED_NOTES });
+    await flushPendingNoteWrites();
+    const adopted = readFileSync(SESSION_NOTES, "utf8");
+    await handlers.get("session_start")![0]({ type: "session_start", reason: "resume" }, ctx);
+    await flushPendingNoteWrites();
+    expect(existsSync(LEGACY_NOTES)).toBe(false); // no resurrection
+    expect(readFileSync(SESSION_NOTES, "utf8")).toEqual(adopted); // no duplicate/ghost writes
+    expect(renderOf(customCalls.at(-1)!)).toContain("2 heads-up"); // tally still right after the restart
+  });
+
+  it("prune: session_start prunes stale session files but keeps the current session's file", async () => {
+    const stale = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000); // beyond the default 14-day window
+    for (const id of ["old-session-1", "old-session-2"]) {
+      writeSessionNotes([], id);
+      utimesSync(sessionNotesPath(id), stale, stale);
+    }
+    writeSessionNotes([], "recent-session"); // fresh other-session file: must survive
+    const { ui } = await setup({ notes: PERSISTED_NOTES });
+    expect(ui.custom).toHaveBeenCalledOnce(); // the restore works alongside pruning
+    await flushPendingNoteWrites();
+    expect(existsSync(SESSION_NOTES)).toBe(true); // the current session's file survives
+    expect(existsSync(sessionNotesPath("recent-session"))).toBe(true);
+    expect(existsSync(sessionNotesPath("old-session-1"))).toBe(false);
+    expect(existsSync(sessionNotesPath("old-session-2"))).toBe(false);
   });
 });
 

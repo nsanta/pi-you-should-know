@@ -19,8 +19,9 @@ and fails quiet by design.
   into gentle-pi's fullscreen right rail when available, or renders as a compact tally
   at the right edge otherwise (keyboard-focus-free in both cases).
 - The agent can also record notes directly through the `heads_up` tool.
-- Pending notes are **persisted per project** in `.pi/you-should-know-notes.json`, so
-  unprocessed notes survive closing and reloading pi (see below).
+- Pending notes are **persisted per session** in
+  `.pi/you-should-know-notes/<session-id>.json`: resuming the same session restores its
+  notes, and a new session starts clean (see below).
 - Reviews are fire-and-forget: a slow or broken reviewer never blocks or breaks the
   session. `session_shutdown` and session replacement abort in-flight reviews.
 
@@ -72,16 +73,23 @@ right-edge tally, and `/ysk` keeps working everywhere.
 `Esc` closes the popup without processing anything. Mouse clicks require a
 fullscreen/alt-screen terminal (pi enables mouse there); in plain terminals use `/ysk`.
 
-### Pending notes persist across restarts
+### Pending notes persist per session
 
-The pending store is mirrored to a per-project state file,
-`.pi/you-should-know-notes.json` (plain JSON, `{ "notes": [...] }`, oldest first).
-Unprocessed notes are restored on the next session start, so the tally survives
-closing and reloading pi. A note leaves the file — and never resurfaces — once it is
-processed (`Understood`/`Chat`), dismissed (`0`), permanently known, or evicted by
-the 3-note cap. Permanently dismissed topics are additionally blocked from ever
-being re-raised (see `dismissedTopics` below). The file is pure state: gitignore it
-freely, and delete it to reset the project's pending notes.
+The pending store is mirrored to a per-session state file,
+`.pi/you-should-know-notes/<session-id>.json` (plain JSON, `{ "notes": [...] }`, oldest
+first). Resuming the same session restores its unprocessed notes, so the tally survives
+closing and reloading pi; a new session starts clean and fills its own tally. A note
+leaves the file — and never resurfaces — once it is processed (`Understood`/`Chat`),
+dismissed (`0`), permanently known, or evicted by the 3-note cap. Permanently dismissed
+topics are additionally blocked from ever being re-raised (see `dismissedTopics` below).
+
+The files are pure state: gitignore them freely, and delete a session's file (or the
+whole directory) to reset its pending notes. Housekeeping is automatic: the 20 most
+recent session files are kept, files older than 14 days are pruned, and the current
+session's file is never touched. A pre-per-session install's global
+`.pi/you-should-know-notes.json` is adopted once — by the next session that starts,
+which inherits those notes — and then removed, so old notes migrate exactly once and
+never leak into other sessions.
 
 ## Subagent relay
 
@@ -164,10 +172,13 @@ union of both:
   or a bare `"model-id"` matched across all known models. An unknown model falls
   back to the session's current model.
 
-Pending notes live in a separate **state** file, `.pi/you-should-know-notes.json`,
-written entirely by the extension (one `{ "notes": [...] }` object, oldest first).
-A missing or corrupt file simply starts empty; delete it (or gitignore it) to reset
-the project's pending notes.
+Pending notes live in per-session **state** files,
+`.pi/you-should-know-notes/<session-id>.json`, written entirely by the extension (one
+`{ "notes": [...] }` object per session, oldest first). A missing or corrupt file
+simply starts empty; delete a session's file (or gitignore the directory) to reset
+that session's pending notes. Old session files are pruned automatically (20 most
+recent kept, 14-day age cap); a pre-per-session global notes file is adopted once by
+the next starting session and removed.
 
 ## `/ysk` actions
 
@@ -226,6 +237,7 @@ error, unknown model) is swallowed and the widget simply stays as it was. If the
 seems stuck, run `/ysk status` — it shows the cadence, whether a review is in
 flight, and the pending/dismissed counts. Permanently dismissed topics live in
 `.pi/you-should-know.json`; delete an entry there to un-dismiss it. Pending notes
-live in `.pi/you-should-know-notes.json`; delete the file to clear the tally.
+live in `.pi/you-should-know-notes/<session-id>.json`; delete the session's file (or
+the whole directory) to clear the tally.
 
 Design and task breakdown: [odd/tasks/you-should-know.md](odd/tasks/you-should-know.md).

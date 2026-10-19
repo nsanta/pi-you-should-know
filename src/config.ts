@@ -7,9 +7,9 @@
  * affected layer simply contributes nothing and defaults stand in.
  */
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { coerceSeverity, normalizeTopic, type Note } from "./notes.ts";
 import { parseOrigin } from "./relay.ts";
 
@@ -18,6 +18,12 @@ export const DEFAULT_REVIEW_EVERY = 6;
 
 /** Subagent relay default ingest window, in hours. */
 export const DEFAULT_RELAY_MAX_AGE_HOURS = 24;
+
+/** Session-notes retention default: how many per-session files survive a prune. */
+export const DEFAULT_PRUNE_KEEP = 20;
+
+/** Session-notes retention default: file age (ms) beyond which a file is pruned (14 days). */
+export const DEFAULT_PRUNE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** Fully resolved extension configuration. */
 export interface YskConfig {
@@ -136,6 +142,58 @@ export async function savePendingNotes(path: string, notes: Note[]): Promise<voi
   const json = `${JSON.stringify({ notes: Array.isArray(notes) ? notes : [] }, null, 2)}\n`;
   await mkdir(dirname(resolved), { recursive: true });
   await writeFile(resolved, json, "utf8");
+}
+
+/**
+ * Prune the per-session pending-notes directory: keep the `keep` most
+ * recently modified `*.json` files (default 20) and delete files older
+ * than `maxAgeMs` (default 14 days), whichever hits first.
+ * `keepPath` (the current session's own absolute file path, when known) is
+ * never deleted, whatever its age or rank. Non-`.json` entries, directories,
+ * and unreadable entries are skipped. A missing, invalid, or unlistable
+ * directory is a quiet no-op, and neither the listing nor any individual
+ * deletion ever throws: retention is best-effort housekeeping.
+ */
+export async function pruneSessionNotes(
+  dir: string,
+  options: { keep?: number; maxAgeMs?: number; keepPath?: string } = {},
+): Promise<void> {
+  try {
+    if (typeof dir !== "string" || dir.length === 0) return;
+    const entries = await readdir(dir);
+    const keep =
+      typeof options.keep === "number" && Number.isFinite(options.keep) && options.keep >= 0
+        ? Math.floor(options.keep)
+        : DEFAULT_PRUNE_KEEP;
+    const maxAgeMs =
+      typeof options.maxAgeMs === "number" && Number.isFinite(options.maxAgeMs) && options.maxAgeMs >= 0
+        ? options.maxAgeMs
+        : DEFAULT_PRUNE_MAX_AGE_MS;
+    const now = Date.now();
+    const files: Array<{ path: string; mtimeMs: number }> = [];
+    for (const name of entries) {
+      if (!name.endsWith(".json")) continue;
+      const path = join(dir, name);
+      try {
+        const stats = await stat(path);
+        if (stats.isFile()) files.push({ path, mtimeMs: stats.mtimeMs });
+      } catch {
+        // quiet: an unreadable entry is skipped, never fatal
+      }
+    }
+    files.sort((a, b) => b.mtimeMs - a.mtimeMs); // newest first
+    for (const [index, file] of files.entries()) {
+      if (file.path === options.keepPath) continue; // the current session's file is never pruned
+      if (index < keep && now - file.mtimeMs <= maxAgeMs) continue;
+      try {
+        await rm(file.path, { force: true });
+      } catch {
+        // quiet: a failed deletion is skipped, never fatal
+      }
+    }
+  } catch {
+    // quiet: retention is best-effort; a missing/unlistable dir is a no-op
+  }
 }
 
 /** Read one config file into a permissive field map; absent/corrupt => empty. */
