@@ -128,21 +128,25 @@ internal), so they appear as one `subagent` group rather than per-task rows.
 
 ## Install
 
-As a pi package (recommended):
+From GitHub (recommended):
 
 ```bash
-pi package add pi-you-should-know
+pi install git:github.com/nsanta/pi-you-should-know
 ```
 
-Or copy/symlink this directory into your extensions directory and pi picks up
-`src/index.ts` (or load it directly while developing):
+Pi clones the repo into its package directory and loads `src/index.ts` from there
+(no build step — extensions load via `jiti`). Pin a ref by appending it:
+`pi install git:github.com/nsanta/pi-you-should-know@main` or a release tag such as
+`@v0.1.0`. Useful commands: `pi list` (verify it installed), `pi update --extensions`
+(reconcile/update), `pi remove git:github.com/nsanta/pi-you-should-know` (uninstall).
+
+Load it directly from a local checkout only while developing the extension itself:
 
 ```bash
 pi --extension /path/to/pi-you-should-know/src/index.ts
 ```
 
-Pi loads extensions via `jiti`, so no build step is needed. Node dependencies
-(`typebox`) resolve from the package's `node_modules`.
+Node dependencies (`typebox`) resolve from the package's `node_modules`.
 
 ## Configuration
 
