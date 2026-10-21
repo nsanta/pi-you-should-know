@@ -3,3 +3,4 @@ dist/
 *.log
 # Local Pi runtime state
 .atl/
+.pi/
